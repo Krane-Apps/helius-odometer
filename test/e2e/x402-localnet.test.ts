@@ -45,7 +45,12 @@ import {
 } from "../../dev/localnet.js";
 
 const USDC = 1_000_000n;
-const run = validatorAvailable() ? describe : describe.skip;
+const available = validatorAvailable();
+// CI sets E2E_REQUIRE_VALIDATOR=1 so a missing validator fails the job instead of skipping it green.
+if (!available && process.env.E2E_REQUIRE_VALIDATOR === "1") {
+  throw new Error("E2E_REQUIRE_VALIDATOR=1 but no solana-test-validator was found (PATH, SOLANA_BIN or Docker)");
+}
+const run = available ? describe : describe.skip;
 
 run("x402 end-to-end on a local validator", () => {
   let validator: Validator;

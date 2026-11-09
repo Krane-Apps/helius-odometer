@@ -32,4 +32,8 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.3.13/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-      - run: npm run test:e2e
+      - run: solana-test-validator --version
+      # Fail, never skip: the payment path is only proven by these tests.
+      - run: npm run test:e2e -- --reporter=verbose
+        env:
+          E2E_REQUIRE_VALIDATOR: "1"
