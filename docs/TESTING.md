@@ -34,6 +34,21 @@ It verifies:
 8. A stock x402 MCP client on remote `/mcp` pays once, then makes several calls for free.
 9. Credited top-ups equal the USDC the operator received on-chain, and the ledger reconciles.
 
+## Gateway overhead
+
+`npm run loadtest` starts an instant mock upstream and the gateway in separate processes, then compares calling the upstream directly with going through the full metered path. That path covers the session check, rate limits, the ledger reserve and finalize on a WAL SQLite file, and routing.
+
+Measured on 2026-11-09 in the 4-vCPU development container, Node 22.23. The figures are indicative, not a service promise.
+
+| Concurrency | Direct p50 / p95 | Via gateway p50 / p95 | Added p50 / p95 | Gateway throughput |
+|---:|---|---|---|---:|
+| 1 | 0.70 / 1.11 ms | 2.54 / 4.64 ms | 1.85 / 3.53 ms | 356 req/s |
+| 32 | 6.50 / 15.68 ms | 45.54 / 69.05 ms | queueing at capacity | 682 req/s |
+
+One process sustains about 680 metered calls per second, more than the request limits of the Helius plans the plan considers. At low concurrency the gateway adds about 2 ms, small next to typical upstream latency. Every run debits exactly one charge per call and reconciles.
+
+A CPU profile (`LOADTEST_PROFILE_DIR=<dir> npm run loadtest`) puts about a third of the time in SQLite commits: each call writes two transactions, a reservation and a finalize. Keeping reservations in memory would roughly halve that if more throughput is ever needed. A crash releases reservations anyway.
+
 ## CI
 
 `.github/workflows/ci.yml` runs typecheck, unit and integration tests and the build. A second job installs Agave and runs the end-to-end suite. The e2e suite skips itself when no validator can be started, so check the job log shows `9 passed`.

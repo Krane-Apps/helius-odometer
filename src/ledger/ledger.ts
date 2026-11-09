@@ -1,3 +1,4 @@
+import type { StatementSync } from "node:sqlite";
 import { openDb, transaction, type Db } from "./db.js";
 import { newId } from "../util/ids.js";
 import type { Micros } from "../util/money.js";
@@ -89,10 +90,22 @@ export class Ledger {
   private readonly now: () => number;
   private readonly defaultDailyCap: Micros;
 
+  /** Prepared statements are compiled once and reused; preparing per call dominated CPU time. */
+  private readonly statements = new Map<string, StatementSync>();
+
   constructor(opts: LedgerOptions) {
     this.db = openDb(opts.path);
     this.now = opts.now ?? Date.now;
     this.defaultDailyCap = opts.defaultDailyCap;
+  }
+
+  private q(sql: string): StatementSync {
+    let stmt = this.statements.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.statements.set(sql, stmt);
+    }
+    return stmt;
   }
 
   close(): void {
@@ -106,7 +119,7 @@ export class Ledger {
   // ---------------------------------------------------------------- accounts
 
   getAccount(wallet: string): Account | undefined {
-    const row = this.db.prepare("SELECT * FROM accounts WHERE wallet = ?").get(wallet) as AccountRow | undefined;
+    const row = this.q("SELECT * FROM accounts WHERE wallet = ?").get(wallet) as AccountRow | undefined;
     return row ? toAccount(row) : undefined;
   }
 
@@ -115,8 +128,7 @@ export class Ledger {
   }
 
   spentToday(wallet: string): Micros {
-    const row = this.db
-      .prepare("SELECT spent FROM daily_usage WHERE wallet = ? AND day = ?")
+    const row = this.q("SELECT spent FROM daily_usage WHERE wallet = ? AND day = ?")
       .get(wallet, this.day()) as { spent: number } | undefined;
     return row?.spent ?? 0;
   }
@@ -130,8 +142,7 @@ export class Ledger {
 
   private ensureAccount(wallet: string): void {
     const now = this.now();
-    this.db
-      .prepare("INSERT OR IGNORE INTO accounts (wallet, created_at, updated_at) VALUES (?, ?, ?)")
+    this.q("INSERT OR IGNORE INTO accounts (wallet, created_at, updated_at) VALUES (?, ?, ?)")
       .run(wallet, now, now);
   }
 
@@ -139,7 +150,7 @@ export class Ledger {
   setDailyCap(wallet: string, cap: Micros | null): Account {
     return transaction(this.db, () => {
       this.ensureAccount(wallet);
-      this.db.prepare("UPDATE accounts SET daily_cap = ?, updated_at = ? WHERE wallet = ?").run(cap, this.now(), wallet);
+      this.q("UPDATE accounts SET daily_cap = ?, updated_at = ? WHERE wallet = ?").run(cap, this.now(), wallet);
       return this.getAccount(wallet)!;
     });
   }
@@ -148,8 +159,7 @@ export class Ledger {
   bumpSessionEpoch(wallet: string): number {
     return transaction(this.db, () => {
       this.ensureAccount(wallet);
-      this.db
-        .prepare("UPDATE accounts SET session_epoch = session_epoch + 1, updated_at = ? WHERE wallet = ?")
+      this.q("UPDATE accounts SET session_epoch = session_epoch + 1, updated_at = ? WHERE wallet = ?")
         .run(this.now(), wallet);
       return this.getAccount(wallet)!.sessionEpoch;
     });
@@ -164,18 +174,16 @@ export class Ledger {
    */
   beginTopup(args: { payloadHash: string; network: string; asset: string; amount: Micros }): TopupBegin {
     return transaction(this.db, () => {
-      const row = this.db
-        .prepare("SELECT id, status, tx_signature FROM topups WHERE payload_hash = ?")
+      const row = this.q("SELECT id, status, tx_signature FROM topups WHERE payload_hash = ?")
         .get(args.payloadHash) as { id: string; status: string; tx_signature: string | null } | undefined;
       if (row?.status === "settled") return { status: "duplicate-settled", id: row.id, txSignature: row.tx_signature };
       if (row?.status === "settling") return { status: "duplicate-in-flight", id: row.id };
       if (row) {
-        this.db.prepare("UPDATE topups SET status = 'settling', error = NULL WHERE id = ?").run(row.id);
+        this.q("UPDATE topups SET status = 'settling', error = NULL WHERE id = ?").run(row.id);
         return { status: "new", id: row.id };
       }
       const id = newId("top");
-      this.db
-        .prepare(
+      this.q(
           `INSERT INTO topups (id, amount, network, asset, payload_hash, status, created_at)
            VALUES (?, ?, ?, ?, ?, 'settling', ?)`,
         )
@@ -198,13 +206,12 @@ export class Ledger {
   }): { credited: boolean; topupId: string; balance: Micros } {
     if (!(args.amount > 0)) throw new Error("top-up amount must be positive");
     return transaction(this.db, () => {
-      const bySig = this.db
-        .prepare("SELECT id, payload_hash, status FROM topups WHERE tx_signature = ?")
+      const bySig = this.q("SELECT id, payload_hash, status FROM topups WHERE tx_signature = ?")
         .get(args.txSignature) as { id: string; payload_hash: string; status: string } | undefined;
       if (bySig && bySig.status === "settled") {
         return { credited: false, topupId: bySig.id, balance: this.getAccount(args.wallet)?.balance ?? 0 };
       }
-      let row = this.db.prepare("SELECT id, status FROM topups WHERE payload_hash = ?").get(args.payloadHash) as
+      let row = this.q("SELECT id, status FROM topups WHERE payload_hash = ?").get(args.payloadHash) as
         | { id: string; status: string }
         | undefined;
       if (row?.status === "settled") {
@@ -213,43 +220,37 @@ export class Ledger {
       const now = this.now();
       if (!row) {
         const id = newId("top");
-        this.db
-          .prepare(
+        this.q(
             `INSERT INTO topups (id, amount, network, asset, payload_hash, status, created_at)
              VALUES (?, ?, ?, ?, ?, 'settling', ?)`,
           )
           .run(id, args.amount, args.network, args.asset, args.payloadHash, now);
         row = { id, status: "settling" };
       }
-      this.db
-        .prepare(
+      this.q(
           `UPDATE topups SET status = 'settled', wallet = ?, tx_signature = ?, amount = ?, settled_at = ?, error = NULL
            WHERE id = ?`,
         )
         .run(args.wallet, args.txSignature, args.amount, now, row.id);
       this.ensureAccount(args.wallet);
-      this.db
-        .prepare(
+      this.q(
           `UPDATE accounts SET balance = balance + ?, total_topped_up = total_topped_up + ?, updated_at = ?
            WHERE wallet = ?`,
         )
         .run(args.amount, args.amount, now, args.wallet);
-      this.db
-        .prepare("INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'topup', ?, ?, ?, ?)")
+      this.q("INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'topup', ?, ?, ?, ?)")
         .run(args.wallet, args.amount, row.id, args.txSignature, now);
       return { credited: true, topupId: row.id, balance: this.getAccount(args.wallet)!.balance };
     });
   }
 
   failTopup(payloadHash: string, error: string): void {
-    this.db
-      .prepare("UPDATE topups SET status = 'failed', error = ? WHERE payload_hash = ? AND status = 'settling'")
+    this.q("UPDATE topups SET status = 'failed', error = ? WHERE payload_hash = ? AND status = 'settling'")
       .run(error.slice(0, 500), payloadHash);
   }
 
   markTopupNeedsReview(payloadHash: string, error: string, details?: { wallet?: string; txSignature?: string }): void {
-    this.db
-      .prepare(
+    this.q(
         `UPDATE topups SET status = 'needs_review', error = ?, wallet = COALESCE(?, wallet),
          tx_signature = COALESCE(?, tx_signature) WHERE payload_hash = ? AND status != 'settled'`,
       )
@@ -269,7 +270,7 @@ export class Ledger {
     }
     const sql = `SELECT * FROM topups ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT ?`;
     params.push(Math.min(filter.limit ?? 100, 1000));
-    return this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return this.q(sql).all(...params) as Array<Record<string, unknown>>;
   }
 
   // ---------------------------------------------------------------- spending
@@ -287,11 +288,9 @@ export class Ledger {
       }
       const id = newId("res");
       const now = this.now();
-      this.db
-        .prepare("UPDATE accounts SET reserved = reserved + ?, updated_at = ? WHERE wallet = ?")
+      this.q("UPDATE accounts SET reserved = reserved + ?, updated_at = ? WHERE wallet = ?")
         .run(args.amount, now, args.wallet);
-      this.db
-        .prepare(
+      this.q(
           `INSERT INTO reservations (id, wallet, amount, tier, methods, request_id, status, created_at)
            VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?)`,
         )
@@ -306,8 +305,7 @@ export class Ledger {
    */
   finalize(reservationId: string, charged: Micros, calls = 1): { charged: Micros; balance: Micros; available: Micros } {
     return transaction(this.db, () => {
-      const res = this.db
-        .prepare("SELECT wallet, amount, status, charged FROM reservations WHERE id = ?")
+      const res = this.q("SELECT wallet, amount, status, charged FROM reservations WHERE id = ?")
         .get(reservationId) as { wallet: string; amount: number; status: string; charged: number } | undefined;
       if (!res) throw new Error(`unknown reservation ${reservationId}`);
       if (res.status !== "reserved") {
@@ -316,22 +314,18 @@ export class Ledger {
       }
       const amount = Math.max(0, Math.min(Math.floor(charged), res.amount));
       const now = this.now();
-      this.db
-        .prepare(
+      this.q(
           `UPDATE accounts SET reserved = reserved - ?, balance = balance - ?, total_spent = total_spent + ?, updated_at = ?
            WHERE wallet = ?`,
         )
         .run(res.amount, amount, amount, now, res.wallet);
-      this.db
-        .prepare("UPDATE reservations SET status = 'finalized', charged = ?, resolved_at = ? WHERE id = ?")
+      this.q("UPDATE reservations SET status = 'finalized', charged = ?, resolved_at = ? WHERE id = ?")
         .run(amount, now, reservationId);
       if (amount > 0) {
-        this.db
-          .prepare("INSERT INTO journal (wallet, kind, amount, ref, created_at) VALUES (?, 'debit', ?, ?, ?)")
+        this.q("INSERT INTO journal (wallet, kind, amount, ref, created_at) VALUES (?, 'debit', ?, ?, ?)")
           .run(res.wallet, -amount, reservationId, now);
       }
-      this.db
-        .prepare(
+      this.q(
           `INSERT INTO daily_usage (wallet, day, calls, spent) VALUES (?, ?, ?, ?)
            ON CONFLICT (wallet, day) DO UPDATE SET calls = calls + excluded.calls, spent = spent + excluded.spent`,
         )
@@ -343,16 +337,14 @@ export class Ledger {
 
   release(reservationId: string): void {
     transaction(this.db, () => {
-      const res = this.db.prepare("SELECT wallet, amount, status FROM reservations WHERE id = ?").get(reservationId) as
+      const res = this.q("SELECT wallet, amount, status FROM reservations WHERE id = ?").get(reservationId) as
         | { wallet: string; amount: number; status: string }
         | undefined;
       if (!res || res.status !== "reserved") return;
       const now = this.now();
-      this.db
-        .prepare("UPDATE accounts SET reserved = reserved - ?, updated_at = ? WHERE wallet = ?")
+      this.q("UPDATE accounts SET reserved = reserved - ?, updated_at = ? WHERE wallet = ?")
         .run(res.amount, now, res.wallet);
-      this.db
-        .prepare("UPDATE reservations SET status = 'released', resolved_at = ? WHERE id = ?")
+      this.q("UPDATE reservations SET status = 'released', resolved_at = ? WHERE id = ?")
         .run(now, reservationId);
     });
   }
@@ -360,8 +352,7 @@ export class Ledger {
   /** Releases reservations left open by a crash or a hung request. */
   releaseStaleReservations(olderThanMs: number): number {
     const cutoff = this.now() - olderThanMs;
-    const stale = this.db
-      .prepare("SELECT id FROM reservations WHERE status = 'reserved' AND created_at < ?")
+    const stale = this.q("SELECT id FROM reservations WHERE status = 'reserved' AND created_at < ?")
       .all(cutoff) as Array<{ id: string }>;
     for (const { id } of stale) this.release(id);
     return stale.length;
@@ -371,14 +362,12 @@ export class Ledger {
 
   idempotencyBegin(wallet: string, key: string, requestHash: string): IdempotencyBegin {
     return transaction(this.db, () => {
-      const row = this.db
-        .prepare("SELECT request_hash, status, http_status, headers, body FROM idempotency WHERE wallet = ? AND key = ?")
+      const row = this.q("SELECT request_hash, status, http_status, headers, body FROM idempotency WHERE wallet = ? AND key = ?")
         .get(wallet, key) as
         | { request_hash: string; status: string; http_status: number | null; headers: string | null; body: string | null }
         | undefined;
       if (!row) {
-        this.db
-          .prepare(
+        this.q(
             "INSERT INTO idempotency (wallet, key, request_hash, status, created_at) VALUES (?, ?, ?, 'in_flight', ?)",
           )
           .run(wallet, key, requestHash, this.now());
@@ -396,17 +385,16 @@ export class Ledger {
   }
 
   idempotencyComplete(wallet: string, key: string, status: number, headers: Record<string, string>, body: string): void {
-    this.db
-      .prepare("UPDATE idempotency SET status = 'done', http_status = ?, headers = ?, body = ? WHERE wallet = ? AND key = ?")
+    this.q("UPDATE idempotency SET status = 'done', http_status = ?, headers = ?, body = ? WHERE wallet = ? AND key = ?")
       .run(status, JSON.stringify(headers), body, wallet, key);
   }
 
   idempotencyAbort(wallet: string, key: string): void {
-    this.db.prepare("DELETE FROM idempotency WHERE wallet = ? AND key = ? AND status = 'in_flight'").run(wallet, key);
+    this.q("DELETE FROM idempotency WHERE wallet = ? AND key = ? AND status = 'in_flight'").run(wallet, key);
   }
 
   pruneIdempotency(olderThanMs = DAY_MS): number {
-    return Number(this.db.prepare("DELETE FROM idempotency WHERE created_at < ?").run(this.now() - olderThanMs).changes);
+    return Number(this.q("DELETE FROM idempotency WHERE created_at < ?").run(this.now() - olderThanMs).changes);
   }
 
   // ----------------------------------------------------------------- refunds
@@ -421,20 +409,17 @@ export class Ledger {
       if (value > available) throw new LedgerError("insufficient_balance", "Refund exceeds available balance");
       const id = newId("ref");
       const now = this.now();
-      this.db
-        .prepare(
+      this.q(
           `UPDATE accounts SET balance = balance - ?, total_refunded = total_refunded + ?, updated_at = ?
            WHERE wallet = ?`,
         )
         .run(value, value, now, wallet);
-      this.db
-        .prepare(
+      this.q(
           `INSERT INTO refunds (id, wallet, amount, destination, status, created_at)
            VALUES (?, ?, ?, ?, 'requested', ?)`,
         )
         .run(id, wallet, value, destination, now);
-      this.db
-        .prepare("INSERT INTO journal (wallet, kind, amount, ref, created_at) VALUES (?, 'refund', ?, ?, ?)")
+      this.q("INSERT INTO journal (wallet, kind, amount, ref, created_at) VALUES (?, 'refund', ?, ?, ?)")
         .run(wallet, -value, id, now);
       return this.getRefund(id)!;
     });
@@ -447,27 +432,24 @@ export class Ledger {
       if (refund.status !== "requested") throw new LedgerError("already_resolved", `refund ${id} is ${refund.status}`);
       const now = this.now();
       if (status === "rejected") {
-        this.db
-          .prepare(
+        this.q(
             `UPDATE accounts SET balance = balance + ?, total_refunded = total_refunded - ?, updated_at = ?
              WHERE wallet = ?`,
           )
           .run(refund.amount, refund.amount, now, refund.wallet);
-        this.db
-          .prepare(
+        this.q(
             "INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'refund_reversal', ?, ?, ?, ?)",
           )
           .run(refund.wallet, refund.amount, id, opts.note ?? null, now);
       }
-      this.db
-        .prepare("UPDATE refunds SET status = ?, tx_signature = ?, note = ?, resolved_at = ? WHERE id = ?")
+      this.q("UPDATE refunds SET status = ?, tx_signature = ?, note = ?, resolved_at = ? WHERE id = ?")
         .run(status, opts.txSignature ?? null, opts.note ?? null, now, id);
       return this.getRefund(id)!;
     });
   }
 
   getRefund(id: string): Refund | undefined {
-    const row = this.db.prepare("SELECT * FROM refunds WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    const row = this.q("SELECT * FROM refunds WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     return row ? toRefund(row) : undefined;
   }
 
@@ -482,8 +464,7 @@ export class Ledger {
       where.push("status = ?");
       params.push(filter.status);
     }
-    const rows = this.db
-      .prepare(`SELECT * FROM refunds ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT 500`)
+    const rows = this.q(`SELECT * FROM refunds ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT 500`)
       .all(...params) as Array<Record<string, unknown>>;
     return rows.map(toRefund);
   }
@@ -498,19 +479,16 @@ export class Ledger {
       const account = this.getAccount(wallet)!;
       if (account.available + amount < 0) throw new LedgerError("insufficient_balance", "adjustment would go negative");
       const now = this.now();
-      this.db
-        .prepare("UPDATE accounts SET balance = balance + ?, updated_at = ? WHERE wallet = ?")
+      this.q("UPDATE accounts SET balance = balance + ?, updated_at = ? WHERE wallet = ?")
         .run(amount, now, wallet);
-      this.db
-        .prepare("INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'adjustment', ?, ?, ?, ?)")
+      this.q("INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'adjustment', ?, ?, ?, ?)")
         .run(wallet, amount, newId("adj"), note.slice(0, 500), now);
       return this.getAccount(wallet)!;
     });
   }
 
   journal(wallet: string, limit = 50): Array<Record<string, unknown>> {
-    return this.db
-      .prepare("SELECT kind, amount, ref, note, created_at FROM journal WHERE wallet = ? ORDER BY id DESC LIMIT ?")
+    return this.q("SELECT kind, amount, ref, note, created_at FROM journal WHERE wallet = ? ORDER BY id DESC LIMIT ?")
       .all(wallet, Math.min(limit, 500)) as Array<Record<string, unknown>>;
   }
 
@@ -524,28 +502,25 @@ export class Ledger {
   reconcile(opts: { staleReservationMs?: number; staleTopupMs?: number } = {}): ReconcileReport {
     const released = this.releaseStaleReservations(opts.staleReservationMs ?? 120_000);
     const topupCutoff = this.now() - (opts.staleTopupMs ?? 600_000);
-    this.db
-      .prepare(
+    this.q(
         "UPDATE topups SET status = 'needs_review', error = COALESCE(error, 'settlement outcome unknown') WHERE status = 'settling' AND created_at < ?",
       )
       .run(topupCutoff);
-    const balanceMismatches = this.db
-      .prepare(
+    const balanceMismatches = this.q(
         `SELECT a.wallet AS wallet, a.balance AS balance, COALESCE(SUM(j.amount), 0) AS journalSum
          FROM accounts a LEFT JOIN journal j ON j.wallet = a.wallet
          GROUP BY a.wallet HAVING a.balance != COALESCE(SUM(j.amount), 0)`,
       )
       .all() as Array<{ wallet: string; balance: number; journalSum: number }>;
-    const reservedMismatches = this.db
-      .prepare(
+    const reservedMismatches = this.q(
         `SELECT a.wallet AS wallet, a.reserved AS reserved,
            COALESCE((SELECT SUM(r.amount) FROM reservations r WHERE r.wallet = a.wallet AND r.status = 'reserved'), 0) AS openReservations
          FROM accounts a
          WHERE a.reserved != COALESCE((SELECT SUM(r.amount) FROM reservations r WHERE r.wallet = a.wallet AND r.status = 'reserved'), 0)`,
       )
       .all() as Array<{ wallet: string; reserved: number; openReservations: number }>;
-    const checked = (this.db.prepare("SELECT COUNT(*) AS n FROM accounts").get() as { n: number }).n;
-    const review = (this.db.prepare("SELECT COUNT(*) AS n FROM topups WHERE status = 'needs_review'").get() as { n: number }).n;
+    const checked = (this.q("SELECT COUNT(*) AS n FROM accounts").get() as { n: number }).n;
+    const review = (this.q("SELECT COUNT(*) AS n FROM topups WHERE status = 'needs_review'").get() as { n: number }).n;
     return {
       checkedAccounts: checked,
       balanceMismatches,
@@ -560,30 +535,28 @@ export class Ledger {
 
   /** Atomically marks a nonce as used. Returns false if it was already used. */
   useNonce(nonce: string, expiresAt: number): boolean {
-    const res = this.db.prepare("INSERT OR IGNORE INTO siwx_nonces (nonce, expires_at) VALUES (?, ?)").run(nonce, expiresAt);
+    const res = this.q("INSERT OR IGNORE INTO siwx_nonces (nonce, expires_at) VALUES (?, ?)").run(nonce, expiresAt);
     return Number(res.changes) === 1;
   }
 
   pruneNonces(): number {
-    return Number(this.db.prepare("DELETE FROM siwx_nonces WHERE expires_at < ?").run(this.now()).changes);
+    return Number(this.q("DELETE FROM siwx_nonces WHERE expires_at < ?").run(this.now()).changes);
   }
 
   // ------------------------------------------------------------------ funnel
 
   recordEvent(kind: string, wallet?: string | null, subject?: string | null): void {
-    this.db
-      .prepare("INSERT INTO events (kind, wallet, subject, created_at) VALUES (?, ?, ?, ?)")
+    this.q("INSERT INTO events (kind, wallet, subject, created_at) VALUES (?, ?, ?, ?)")
       .run(kind, wallet ?? null, subject ?? null, this.now());
   }
 
   pruneEvents(olderThanMs = 90 * DAY_MS): number {
-    return Number(this.db.prepare("DELETE FROM events WHERE created_at < ?").run(this.now() - olderThanMs).changes);
+    return Number(this.q("DELETE FROM events WHERE created_at < ?").run(this.now() - olderThanMs).changes);
   }
 
   stats(sinceMs?: number): Record<string, unknown> {
     const since = sinceMs ?? 0;
-    const totals = this.db
-      .prepare(
+    const totals = this.q(
         `SELECT COUNT(*) AS accounts,
            SUM(CASE WHEN total_topped_up > 0 THEN 1 ELSE 0 END) AS fundedWallets,
            SUM(CASE WHEN total_spent > 0 THEN 1 ELSE 0 END) AS spendingWallets,
@@ -595,17 +568,14 @@ export class Ledger {
          FROM accounts`,
       )
       .get() as Record<string, number>;
-    const usage = this.db
-      .prepare("SELECT COALESCE(SUM(calls), 0) AS calls, COALESCE(SUM(spent), 0) AS spent FROM daily_usage")
+    const usage = this.q("SELECT COALESCE(SUM(calls), 0) AS calls, COALESCE(SUM(spent), 0) AS spent FROM daily_usage")
       .get() as Record<string, number>;
-    const events = this.db
-      .prepare(
+    const events = this.q(
         `SELECT kind, COUNT(*) AS count, COUNT(DISTINCT wallet) AS wallets, COUNT(DISTINCT subject) AS subjects
          FROM events WHERE created_at >= ? GROUP BY kind`,
       )
       .all(since) as Array<{ kind: string; count: number; wallets: number; subjects: number }>;
-    const topups = this.db
-      .prepare("SELECT status, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS amount FROM topups GROUP BY status")
+    const topups = this.q("SELECT status, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS amount FROM topups GROUP BY status")
       .all() as Array<{ status: string; count: number; amount: number }>;
     return { totals, usage, events, topups };
   }

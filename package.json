@@ -30,7 +30,8 @@
     "facilitator": "tsx src/facilitator/main.ts",
     "mcp": "tsx src/mcp/main.ts",
     "bench": "tsx src/bench/main.ts",
-    "localnet": "tsx scripts/localnet.ts"
+    "localnet": "tsx scripts/localnet.ts",
+    "loadtest": "tsx scripts/loadtest.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.6",
