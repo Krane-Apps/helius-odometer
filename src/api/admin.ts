@@ -181,10 +181,23 @@ export function registerAdminRoutes(app: Hono, deps: AppDeps): void {
     const add = (name: string, status: Check["status"], detail: string) => checks.push({ name, status, detail });
     const { config, ledger } = deps;
 
+    if (!deps.payments.initialized) {
+      add("facilitator", "fail", `facilitator not synced: ${deps.payments.lastInitError ?? "pending"}`);
+    } else {
+      // Solana exact payments need the facilitator's fee payer; clients cannot build a payment without one.
+      const requirements = await deps.payments.buildTopupRequirements().catch(() => []);
+      const feePayer = (requirements[0]?.extra as { feePayer?: unknown } | undefined)?.feePayer;
+      add(
+        "facilitator",
+        typeof feePayer === "string" ? "pass" : "fail",
+        typeof feePayer === "string" ? `synced; fee payer ${feePayer}` : `the facilitator offers no fee payer for ${config.network}`,
+      );
+    }
+    const https = config.publicOrigin.startsWith("https://");
     add(
-      "facilitator",
-      deps.payments.initialized ? "pass" : "fail",
-      deps.payments.initialized ? "facilitator capabilities loaded" : `facilitator not synced: ${deps.payments.lastInitError ?? "pending"}`,
+      "public_origin",
+      https ? "pass" : config.network === SOLANA_MAINNET ? "fail" : "warn",
+      https ? config.publicOrigin : `${config.publicOrigin} is not HTTPS: session tokens and sign-in proofs would travel in clear text`,
     );
     if (config.network !== SOLANA_MAINNET) add("network", "warn", `${config.network} is not Solana mainnet: a test deployment`);
     else if (config.paymentAsset !== USDC_MINTS[SOLANA_MAINNET]) add("network", "warn", "mainnet with a non-USDC payment asset");

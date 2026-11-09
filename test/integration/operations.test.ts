@@ -8,7 +8,7 @@ import { decodePaymentRequiredHeader, encodePaymentSignatureHeader } from "@x402
 import type { PaymentRequired } from "@x402/core/types";
 import { FacilitatorTimeoutError } from "@x402/core/server";
 import { startMockRpc, type MockRpc } from "../helpers/mock-rpc.js";
-import { FakeFacilitator } from "../helpers/fake-facilitator.js";
+import { FAKE_FEE_PAYER, FakeFacilitator } from "../helpers/fake-facilitator.js";
 import { startApp, type StartedApp } from "../helpers/app-fixture.js";
 import { SOLANA_DEVNET } from "../../src/config.js";
 import { associatedTokenAccounts } from "../../src/payments/verify.js";
@@ -128,7 +128,9 @@ describe("operations: receipts, readiness, single writer, alerts", () => {
     for (const name of ["facilitator", "storage", "session_secret", "alerts", "writer_lock", "ledger_arithmetic", "unresolved_topups", "custody"]) {
       expect(byName[name], name).toMatchObject({ status: "pass" });
     }
+    expect(byName.facilitator!.detail).toBe(`synced; fee payer ${FAKE_FEE_PAYER}`);
     expect(byName.network).toMatchObject({ status: "warn" }); // devnet test deployment
+    expect(byName.public_origin).toMatchObject({ status: "warn" }); // plain-HTTP test origin, allowed off mainnet
     expect(byName.branding).toMatchObject({ status: "warn" }); // default public name includes Helius
   });
 

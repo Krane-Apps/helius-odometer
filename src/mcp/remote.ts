@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { PaymentRequirements, Price, SettleResponse } from "@x402/core/types";
+import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
 import { extractPaymentFromMeta, MCP_PAYMENT_RESPONSE_META_KEY } from "@x402/mcp";
 import { z } from "zod";
 import { bearerToken } from "../payments/session.js";
@@ -284,22 +284,6 @@ function buildServer(deps: AppDeps, state: McpSession, index: BindingIndex): Mcp
   return server;
 }
 
-async function topupRequirements(deps: AppDeps): Promise<PaymentRequirements[]> {
-  const built = await Promise.all(
-    deps.payments.topupOptions().map((o) =>
-      deps.payments.resourceServer.buildPaymentRequirements({
-        scheme: o.scheme,
-        network: o.network,
-        payTo: o.payTo as string,
-        price: o.price as Price,
-        maxTimeoutSeconds: o.maxTimeoutSeconds,
-        extra: o.extra,
-      }),
-    ),
-  );
-  return built.flat();
-}
-
 async function paymentRequired(deps: AppDeps, toolName: string, accepts: PaymentRequirements[], error: string): Promise<ToolResult> {
   const pr = await deps.payments.resourceServer.createPaymentRequiredResponse(
     accepts,
@@ -360,7 +344,7 @@ async function paidCall(
         return text({ error: "payments_unavailable", message: "The payment facilitator is unreachable; retry shortly." }, true);
       }
     }
-    const accepts = await topupRequirements(deps);
+    const accepts = await deps.payments.buildTopupRequirements();
     const payload = extractPaymentFromMeta({ name: toolName, arguments: { method, params }, _meta: meta });
     if (!payload) {
       return paymentRequired(deps, toolName, accepts, wallet ? "Prepaid balance too low for this session; pay a top-up" : "Payment required: pay a prepaid top-up");
@@ -443,7 +427,7 @@ async function paidCall(
     if (reservation.reason === "daily_cap_exceeded") {
       return attach(text({ error: "daily_cap_exceeded", message: "This wallet reached its daily spend cap; not charged" }, true));
     }
-    return attach(await paymentRequired(deps, toolName, await topupRequirements(deps), "Prepaid balance too low; pay a top-up"));
+    return attach(await paymentRequired(deps, toolName, await deps.payments.buildTopupRequirements(), "Prepaid balance too low; pay a top-up"));
   }
   let outcome;
   try {

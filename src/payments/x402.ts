@@ -12,7 +12,7 @@ import {
   type RoutesConfig,
 } from "@x402/core/server";
 import type { PaymentOption } from "@x402/core/http";
-import type { Network, PaymentPayload } from "@x402/core/types";
+import type { Network, PaymentPayload, PaymentRequirements, Price } from "@x402/core/types";
 import { createSIWxResourceServerExtension, declareSIWxExtension } from "@x402/extensions/sign-in-with-x";
 import { bazaarResourceServerExtension, declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import type { Config } from "../config.js";
@@ -258,6 +258,26 @@ export class Payments {
   }
 
   /** One `exact` option per configured top-up denomination, smallest first. */
+  /**
+   * The top-up options as full payment requirements, including what the
+   * facilitator adds (for Solana exact: the fee payer). Needs initialize().
+   */
+  async buildTopupRequirements(): Promise<PaymentRequirements[]> {
+    const built = await Promise.all(
+      this.topupOptions().map((o) =>
+        this.resourceServer.buildPaymentRequirements({
+          scheme: o.scheme,
+          network: o.network,
+          payTo: o.payTo as string,
+          price: o.price as Price,
+          maxTimeoutSeconds: o.maxTimeoutSeconds,
+          extra: o.extra,
+        }),
+      ),
+    );
+    return built.flat();
+  }
+
   topupOptions(): PaymentOption[] {
     const { config } = this.opts;
     return config.topupOptionsUsd.map((usd) => ({
