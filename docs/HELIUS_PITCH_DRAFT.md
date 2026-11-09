@@ -23,7 +23,7 @@ I built **Helius Odometer**, an x402 gateway in front of Helius:
 - **No account, no key.** An agent's wallet pays a USDC top-up through x402; Sign-In-With-Solana and short-lived sessions handle everything after that.
 - **Economics that work.** One on-chain top-up, then off-chain metering per call, so payment overhead doesn't swamp a call that costs Helius a few millionths of a dollar.
 - **Speed is a priced choice.** Economy reads go to free public RPC only. Standard falls back to Helius on 429s, timeouts or lag. Fast always uses Helius. DAS, program scans and transaction landing always go to Helius, at the same price on every tier.
-- **Honest operation.** Failures are never charged, every response says which upstream served it and what it cost, and a ledger reconciles balances against on-chain receipts.
+- **Honest operation.** Delivery failures are never charged, every response says which upstream served it and what it cost, and operators verify settlements against the chain before resolving them.
 - **Tested.** The end-to-end suite runs a real validator with real x402 settlement, a stock x402 client, and MCP agents over both stdio and remote MCP.
 
 **What I'm asking for before any launch:**

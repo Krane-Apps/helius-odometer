@@ -125,6 +125,11 @@ With `X-Odometer-Rebroadcast: true`, a landed `sendTransaction` is re-sent (same
 
 The gateway's own errors use codes `-32050` to `-32064` and say "not charged" when nothing was debited.
 
+Two consequences of this contract are easy to misread:
+
+- A charged `sendTransaction` means the RPC accepted the transaction. It does not mean the transaction landed or succeeded, and the gateway does not price or guarantee inclusion.
+- The balance is debited only the per-call price. Your transactions pay their own Solana fees, priority fees and tips. Top-up settlement fees are paid by the facilitator's fee payer, and any facilitator fee is the operator's cost.
+
 ## Security model
 
 - The gateway never holds client keys. Clients sign their own payment transactions and SIWx messages.

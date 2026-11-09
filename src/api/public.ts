@@ -1,6 +1,7 @@
 import type { Context, Hono } from "hono";
 import { sessionHeaders } from "../payments/paywall.js";
 import { METHODS } from "../pricing/methods.js";
+import { BILLED_ERROR_CODES, BILLING_CONTRACT } from "../pricing/billing.js";
 import { TIERS, type Tier } from "../pricing/pricing.js";
 import { TIER_DESCRIPTIONS } from "../payments/x402.js";
 import { LedgerError } from "../ledger/ledger.js";
@@ -273,10 +274,7 @@ export function pricingDocument(deps: AppDeps): Record<string, unknown> {
     sendTransactionEnabled: config.sendTransactionEnabled,
     rest: restEnabled(deps) ? config.pricing.rest : {},
     topupOptionsUsd: config.topupOptionsUsd,
-    billing: {
-      charged: "Successful results and errors caused by the request itself (for example invalid params)",
-      notCharged: "Gateway or upstream failures: timeouts, rate limits, unhealthy nodes, exhausted pools",
-    },
+    billing: { ...BILLING_CONTRACT, billedErrorCodes: BILLED_ERROR_CODES },
     methods,
   };
 }
@@ -303,7 +301,9 @@ ${tiers}
 
 Every response reports X-Odometer-Charged and X-Odometer-Balance (micros: millionths of a USD).
 Set X-Odometer-Max-Price (USD) to refuse anything pricier than you expect.
-Failures caused by the gateway or upstreams are never charged.
+Billing: gateway and upstream delivery failures (timeouts, rate limits, unhealthy nodes, exhausted pools) are not charged.
+Valid RPC answers are charged, including errors your request causes: invalid params, failed preflight simulation, bad signatures.
+A charged sendTransaction means the RPC accepted it, not that it landed. Your transaction fees, priority fees and tips are separate.
 
 ## Endpoints
 - GET /pricing   per-method prices for every tier

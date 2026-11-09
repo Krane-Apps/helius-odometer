@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OdometerClient, OdometerError, type Tier } from "../client/index.js";
+import { BILLING_SUMMARY } from "../pricing/billing.js";
 
 export interface GatewayIndex {
   network: string;
@@ -49,7 +50,7 @@ export function createOdometerMcpServer(client: OdometerClient, index: GatewayIn
       `solana_rpc_${tier}`,
       {
         title: `Solana RPC (${tier} tier)`,
-        description: `${description} ${SPEED_GUIDANCE} Each call is debited from the prepaid balance; failures caused by the gateway or upstreams are not charged.`,
+        description: `${description} ${SPEED_GUIDANCE} Each call is debited from the prepaid balance. ${BILLING_SUMMARY}`,
         inputSchema: {
           method: z.string().min(1).describe("Solana JSON-RPC or Helius DAS method, e.g. getBalance, getAccountInfo, getAsset"),
           params: paramsSchema,

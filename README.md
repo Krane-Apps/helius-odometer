@@ -10,7 +10,7 @@ An agent pays in USDC from its own wallet, picks a speed tier, and gets routed a
 
 - **x402 v2 payments on Solana** with the official `@x402/*` SDKs: 402 challenges, USDC `exact` top-ups settled before the call is served, replay-proof crediting.
 - **Three tiers.** `economy` uses free public RPC only. `standard` uses public RPC and falls back to Helius automatically. `fast` always uses Helius. Helius-only methods (DAS, indexes) cost the same on every tier.
-- **Prepaid balance ledger** on SQLite: reserve, then debit only what was served, so failures are never charged. Idempotent receipts, refunds, daily caps, and a reconciliation job that proves balances equal their journal.
+- **Prepaid balance ledger** on SQLite: reserve, then debit only what was served, so gateway and upstream delivery failures are never charged. Idempotent receipts, refunds, daily caps, and a reconciliation job that proves balances equal their journal.
 - **Agent identity without accounts.** Sign-In-With-X (SIWS) proofs are bound to the gateway origin with single-use nonces. Short-lived session tokens remove the per-call 402 round trip.
 - **Routing safeguards** from mature routers: health polling, slot-lag ejection, 429 cooling, per-upstream rate limits, commitment normalization, per-wallet `minContextSlot` floors, a finalized-data cache, sticky transaction follow-ups, and single-attempt `sendTransaction`.
 - **Every integration path an agent might use:** plain HTTP with any x402 client, a TypeScript client with a `@solana/kit` transport, a local MCP server (stdio), and a remote MCP endpoint paid over the x402 MCP transport.
@@ -144,7 +144,12 @@ Starting prices, all overridable with `PRICING_FILE`:
 | `sendTransaction` (fast only) | $0.001 |
 | Enhanced Transactions REST | $0.002 |
 
-**Charged:** successful results and errors caused by the request itself, such as invalid params. **Not charged:** gateway or upstream failures, including timeouts, rate limits, unhealthy nodes and exhausted pools.
+The billing contract:
+
+- **Not charged:** gateway and upstream delivery failures, including timeouts, rate limits, unhealthy or lagging nodes, exhausted pools and gateway errors.
+- **Charged:** valid RPC answers, including errors caused by the request itself, such as invalid params (`-32602`), a failed preflight simulation (`-32002`) or a bad signature (`-32003`). `GET /pricing` lists every billed code.
+- **`sendTransaction`:** a charge means the RPC accepted the transaction, not that it landed or succeeded.
+- **Separate costs:** your transactions pay their own Solana fees, priority fees and tips. Top-up settlement fees are the facilitator's and operator's cost, so a top-up credits exactly what you paid.
 
 Every response carries `X-Odometer-Charged` and `X-Odometer-Balance` in micros (one micro is 1e-6 USD, one atomic unit of USDC). `X-Odometer-Max-Price` refuses anything pricier than the caller expects. `GET /pricing` lists every method.
 
