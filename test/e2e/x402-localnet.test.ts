@@ -256,6 +256,74 @@ run("x402 end-to-end on a local validator", () => {
     expect(gw.odometer.deps.ledger.available(payer.address)).toBe(1_000_000 - 10);
   });
 
+  it("serves an MCP agent through the stdio bridge, paying from its own wallet", async () => {
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+    const { createKeyPairSignerFromPrivateKeyBytes, getBase58Encoder } = await import("@solana/kit");
+    const { getTransferCheckedInstruction } = await import("@solana-program/token");
+    const { sendInstructions, ata } = await import("./localnet.js");
+
+    // An exportable wallet, as an agent operator would store it for the MCP server.
+    const seed = crypto.getRandomValues(new Uint8Array(32));
+    const mcpWallet = await createKeyPairSignerFromPrivateKeyBytes(seed);
+    const secret = [...seed, ...getBase58Encoder().encode(mcpWallet.address)];
+    await createAta(rpc, agent, mcpWallet.address, mint);
+    await sendInstructions(rpc, agent, [
+      getTransferCheckedInstruction({
+        source: await ata(agent.address, mint),
+        mint,
+        destination: await ata(mcpWallet.address, mint),
+        authority: agent,
+        amount: 2n * USDC,
+        decimals: 6,
+      }),
+    ]);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", "src/mcp/main.ts"],
+      env: {
+        ...(process.env as Record<string, string>),
+        ODOMETER_URL: gw.url,
+        ODOMETER_WALLET_KEY: JSON.stringify(secret),
+        ODOMETER_ALLOWED_ASSETS: mint,
+        ODOMETER_MAX_TOPUP_USD: "1",
+      },
+      stderr: "pipe",
+    });
+    const mcp = new Client({ name: "e2e-agent", version: "1.0.0" });
+    await mcp.connect(transport);
+    try {
+      const tools = (await mcp.listTools()).tools.map((t) => t.name).sort();
+      expect(tools).toEqual(
+        ["odometer_balance", "odometer_pricing", "odometer_topup", "solana_rpc_economy", "solana_rpc_fast", "solana_rpc_standard"].sort(),
+      );
+      const economy = (await mcp.listTools()).tools.find((t) => t.name === "solana_rpc_economy")!;
+      expect(economy.description).toContain("ask your user how important speed is");
+
+      const before = await tokenBalance(rpc, mcpWallet.address, mint);
+      const call = await mcp.callTool({ name: "solana_rpc_economy", arguments: { method: "getBalance", params: [mcpWallet.address] } });
+      expect(call.isError).toBeFalsy();
+      const payload = JSON.parse((call.content as Array<{ text: string }>)[0]!.text);
+      expect(payload.result.value).toBe(0);
+      expect(payload.cost).toEqual({ chargedUsd: "0.00001", balanceUsd: "0.99999" });
+      expect(payload.topup.payer).toBe(mcpWallet.address);
+      expect(await tokenBalance(rpc, mcpWallet.address, mint)).toBe(before - USDC);
+
+      const price = await mcp.callTool({ name: "odometer_pricing", arguments: { method: "getAsset" } });
+      expect(JSON.parse((price.content as Array<{ text: string }>)[0]!.text).priceUsd.fast).toBe("0.0002");
+      const bal = await mcp.callTool({ name: "odometer_balance", arguments: {} });
+      expect(JSON.parse((bal.content as Array<{ text: string }>)[0]!.text).availableUsd).toBe("0.99999");
+
+      // Spend limits are enforced in the agent's process: a $5 top-up exceeds the $1 cap.
+      const refused = await mcp.callTool({ name: "odometer_topup", arguments: { usd: 5 } });
+      expect(refused.isError).toBe(true);
+      expect(JSON.parse((refused.content as Array<{ text: string }>)[0]!.text).error).toBe("topup_over_limit");
+    } finally {
+      await mcp.close();
+    }
+  });
+
   it("keeps the ledger reconciled with what moved on-chain", async () => {
     const topups = gw.odometer.deps.ledger.listTopups({ status: "settled" });
     const credited = topups.reduce((s, t) => s + Number(t.amount), 0);
