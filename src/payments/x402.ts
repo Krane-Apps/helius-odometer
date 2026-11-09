@@ -22,6 +22,7 @@ import { canonicalJson, sha256Hex } from "../util/json.js";
 import type { Logger } from "../util/log.js";
 import { atomicToMicros, microsToAtomic, usdToMicros } from "../util/money.js";
 import { CachedBlockhashExactSvmScheme, type BlockhashCache } from "./blockhash.js";
+import { classifySettleFailure } from "./settle-outcome.js";
 
 /** Extra context the 402 body explains to the agent (why it must pay). */
 export interface ChallengeContext {
@@ -82,6 +83,8 @@ export interface PaymentsOptions {
   blockhashes?: BlockhashCache;
   /** Paths of paid Helius REST passthrough routes, e.g. "POST /v1/helius/v0/transactions". */
   restRoutes?: Array<{ pattern: string; description: string }>;
+  /** Called when a settlement outcome is unknown and the top-up is frozen for review. */
+  onAmbiguousSettlement?: (info: { payloadHash: string; reason: string; txSignature?: string }) => void;
 }
 
 export const TIER_DESCRIPTIONS: Record<Tier, string> = {
@@ -91,6 +94,24 @@ export const TIER_DESCRIPTIONS: Record<Tier, string> = {
     "Standard tier: public RPC first with automatic escalation to Helius on rate limits, timeouts, lag or errors.",
   fast: "Fast tier: every call goes straight to Helius, including staked sendTransaction.",
 };
+
+/** Explains a failed settlement so the agent knows whether to sign a new payment. */
+export function settlementFailureBody(reason: string | undefined, txSignature?: string): { contentType: string; body: unknown } {
+  const messages: Record<string, string> = {
+    duplicate_payment: "This payment was already settled and credited; your balance includes it.",
+    payment_in_flight: "This payment is already being settled; wait for that request to finish.",
+    payment_under_review: "This payment's outcome is under review; it will be credited if it landed. Do not resend it.",
+  };
+  return {
+    contentType: "application/json",
+    body: {
+      error: "settlement_failed",
+      reason,
+      transaction: txSignature || undefined,
+      message: (reason && messages[reason]) ?? "The payment did not settle and you were not charged. Sign a new payment to retry.",
+    },
+  };
+}
 
 /** Hash of the signed scheme payload: the replay key for a top-up. */
 export function paymentPayloadHash(payload: Pick<PaymentPayload, "payload"> | { payload: unknown }): string {
@@ -151,6 +172,13 @@ export class Payments {
       if (begin.status === "duplicate-in-flight") {
         return { abort: true, reason: "payment_in_flight", message: "This payment is already being settled" };
       }
+      if (begin.status === "under-review") {
+        return {
+          abort: true,
+          reason: "payment_under_review",
+          message: "This payment's outcome is under review; it will be credited if it landed. Do not resend it.",
+        };
+      }
       return undefined;
     });
 
@@ -200,7 +228,16 @@ export class Payments {
     });
 
     this.resourceServer.onSettleFailure(async (ctx) => {
-      ledger.failTopup(paymentPayloadHash(ctx.paymentPayload), ctx.error.message);
+      const payloadHash = paymentPayloadHash(ctx.paymentPayload);
+      const outcome = classifySettleFailure(ctx.error);
+      if (outcome.kind === "failed") {
+        ledger.failTopup(payloadHash, outcome.reason);
+      } else {
+        // Funds may have moved: freeze the receipt for operator review instead of allowing a retry.
+        ledger.markTopupNeedsReview(payloadHash, outcome.reason, { txSignature: outcome.txSignature, wallet: outcome.payer });
+        logger.warn("settlement outcome unknown; top-up frozen for review", { payloadHash, ...outcome });
+        opts.onAmbiguousSettlement?.({ payloadHash, reason: outcome.reason, txSignature: outcome.txSignature });
+      }
       return undefined;
     });
 
@@ -231,6 +268,7 @@ export class Payments {
       tags: ["solana", "rpc", "helius", "prepaid"],
       customPaywallHtml: BROWSER_HTML,
       unpaidResponseBody: (ctx) => this.unpaidBody(ctx),
+      settlementFailedResponseBody: (_ctx, failure) => settlementFailureBody(failure.errorReason, failure.transaction),
       extensions: {
         ...declareSIWxExtension({
           statement: "Sign in to Helius Odometer to spend your prepaid RPC balance",

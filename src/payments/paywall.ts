@@ -1,5 +1,4 @@
 import type { Context } from "hono";
-import { decodePaymentSignatureHeader } from "@x402/core/http";
 import type { Ledger } from "../ledger/ledger.js";
 import type { Logger } from "../util/log.js";
 import type { KeyedRateLimiter } from "../util/token-bucket.js";
@@ -7,7 +6,7 @@ import { sha256Hex } from "../util/json.js";
 import type { Micros } from "../util/money.js";
 import { bearerToken, type SessionManager } from "./session.js";
 import type { SiwxAuth } from "./siwx.js";
-import { paymentPayloadHash, type ChallengeContext, type Payments } from "./x402.js";
+import type { ChallengeContext, Payments } from "./x402.js";
 
 export interface IssuedSession {
   token: string;
@@ -53,7 +52,7 @@ export class Paywall {
     const { payments, ledger, sessions, siwx, logger } = this.deps;
     const paymentHeader = c.req.header("payment-signature") ?? c.req.header("x-payment");
 
-    if (paymentHeader) return this.settleTopup(c, body, paymentHeader);
+    if (paymentHeader) return this.settleTopup(c, body);
 
     let wallet: string | undefined;
     let via: "session" | "siwx" | undefined;
@@ -137,14 +136,8 @@ export class Paywall {
     return { kind: "respond", status: 500, headers: {}, body: { error: "payment_configuration_error" } };
   }
 
-  private async settleTopup(c: Context, body: unknown, paymentHeader: string): Promise<AuthResult> {
-    const { payments, ledger, sessions, logger } = this.deps;
-    let payloadHash: string | undefined;
-    try {
-      payloadHash = paymentPayloadHash(decodePaymentSignatureHeader(paymentHeader));
-    } catch {
-      payloadHash = undefined;
-    }
+  private async settleTopup(c: Context, body: unknown): Promise<AuthResult> {
+    const { payments, sessions, logger } = this.deps;
     if (!payments.initialized) {
       try {
         await withTimeout(payments.initialize(), 5000);
@@ -157,7 +150,23 @@ export class Paywall {
         };
       }
     }
-    const result = await payments.process(c, body, { reason: "payment_required" });
+    let result;
+    try {
+      result = await payments.process(c, body, { reason: "payment_required" });
+    } catch (err) {
+      // The SDK rethrows facilitator transport errors (e.g. a settle timeout). The settlement
+      // hook has already frozen the top-up for review if funds may have moved.
+      logger.warn("settlement request failed", { error: err instanceof Error ? err.message : String(err) });
+      return {
+        kind: "respond",
+        status: 502,
+        headers: {},
+        body: {
+          error: "settlement_unknown",
+          message: "The payment may or may not have settled. It is under review and will be credited if it landed; do not resend it.",
+        },
+      };
+    }
     if (result.type === "payment-verified") {
       const settlement = result.beforeHandlerSettlement;
       const payer = settlement?.result.payer;
@@ -175,7 +184,8 @@ export class Paywall {
         toppedUp: { txSignature: settlement.result.transaction, amountAtomic: settlement.result.amount ?? settlement.requirements.amount },
       };
     }
-    if (payloadHash) ledger.failTopup(payloadHash, "payment rejected before settlement");
+    // Failure bookkeeping lives in the settlement hooks, which know whether this request
+    // owned the attempt; marking here could clobber a concurrent settlement of the same payload.
     if (result.type === "payment-error") {
       return {
         kind: "respond",

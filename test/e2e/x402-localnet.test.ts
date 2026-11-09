@@ -373,6 +373,18 @@ run("x402 end-to-end on a local validator", () => {
     }
   });
 
+  it("verifies a settled top-up against the real chain, as operator recovery would", async () => {
+    const topup = gw.odometer.deps.ledger.listTopups({ status: "settled" }).find((t) => t.wallet === agent.address)!;
+    let verdict: { matches: boolean; evidence: { payer?: string; finalized: boolean; receivedAtomic: string } } | undefined;
+    for (let i = 0; i < 60 && !verdict?.matches; i++) {
+      const res = await fetch(`${gw.url}/admin/topups/${topup.id}/verify`, { headers: { authorization: "Bearer admin-token-0123456789" } });
+      verdict = (await res.json()) as typeof verdict;
+      if (!verdict?.matches) await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(verdict?.matches).toBe(true);
+    expect(verdict?.evidence).toMatchObject({ payer: agent.address, finalized: true, receivedAtomic: "1000000" });
+  });
+
   it("keeps the ledger reconciled with what moved on-chain", async () => {
     const topups = gw.odometer.deps.ledger.listTopups({ status: "settled" });
     const credited = topups.reduce((s, t) => s + Number(t.amount), 0);

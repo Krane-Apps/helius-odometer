@@ -20,7 +20,25 @@ export interface Account {
 export type TopupBegin =
   | { status: "new"; id: string }
   | { status: "duplicate-settled"; id: string; txSignature: string | null }
-  | { status: "duplicate-in-flight"; id: string };
+  | { status: "duplicate-in-flight"; id: string }
+  | { status: "under-review"; id: string };
+
+export interface TopupRow {
+  id: string;
+  wallet: string | null;
+  amount: Micros;
+  network: string;
+  asset: string;
+  payload_hash: string;
+  tx_signature: string | null;
+  status: "settling" | "settled" | "failed" | "needs_review" | "rejected";
+  error: string | null;
+  created_at: number;
+  settled_at: number | null;
+  resolution: string | null;
+  resolution_note: string | null;
+  resolved_at: number | null;
+}
 
 export type ReserveResult =
   | { ok: true; reservationId: string; available: Micros }
@@ -213,6 +231,8 @@ export class Ledger {
         .get(args.payloadHash) as { id: string; status: string; tx_signature: string | null } | undefined;
       if (row?.status === "settled") return { status: "duplicate-settled", id: row.id, txSignature: row.tx_signature };
       if (row?.status === "settling") return { status: "duplicate-in-flight", id: row.id };
+      // An ambiguous settlement may still land; it stays frozen until an operator resolves it.
+      if (row?.status === "needs_review" || row?.status === "rejected") return { status: "under-review", id: row.id };
       if (row) {
         this.q("UPDATE topups SET status = 'settling', error = NULL WHERE id = ?").run(row.id);
         return { status: "new", id: row.id };
@@ -253,6 +273,12 @@ export class Ledger {
         return { credited: false, topupId: row.id, balance: this.getAccount(args.wallet)?.balance ?? 0 };
       }
       const now = this.now();
+      if (row?.status === "rejected") {
+        this.q(
+          "UPDATE topups SET status = 'needs_review', error = ?, wallet = ?, tx_signature = COALESCE(tx_signature, ?) WHERE id = ?",
+        ).run("late settlement after operator rejection", args.wallet, args.txSignature, row.id);
+        return { credited: false, topupId: row.id, balance: this.getAccount(args.wallet)?.balance ?? 0 };
+      }
       if (!row) {
         const id = newId("top");
         this.q(
@@ -276,6 +302,61 @@ export class Ledger {
       this.q("INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'topup', ?, ?, ?, ?)")
         .run(args.wallet, args.amount, row.id, args.txSignature, now);
       return { credited: true, topupId: row.id, balance: this.getAccount(args.wallet)!.balance };
+    });
+  }
+
+  getTopup(id: string): TopupRow | undefined {
+    return this.q("SELECT * FROM topups WHERE id = ?").get(id) as TopupRow | undefined;
+  }
+
+  /** Top-ups whose outcome is unknown: settling past the stale window, or under review. */
+  unresolvedTopups(staleMs = 600_000): TopupRow[] {
+    return this.q("SELECT * FROM topups WHERE status = 'needs_review' OR (status = 'settling' AND created_at < ?) ORDER BY created_at")
+      .all(this.now() - staleMs) as unknown as TopupRow[];
+  }
+
+  /**
+   * Operator resolution of an unresolved top-up, applied to the original
+   * receipt so it can be credited at most once:
+   *  - credit: the receipt itself becomes settled (amount from the receipt,
+   *    never from the operator); a later completion or replay of the same
+   *    payload or signature finds it settled and credits nothing;
+   *  - reject: no money moved; a later settlement of the same payload goes
+   *    back to review instead of crediting automatically.
+   * Never resolve a top-up with a generic adjustment: that leaves this
+   * receipt eligible for a second credit.
+   */
+  resolveTopup(
+    args:
+      | { topupId: string; action: "credit"; wallet: string; txSignature: string; note: string }
+      | { topupId: string; action: "reject"; note: string },
+  ): { topup: TopupRow; credited: boolean; balance?: Micros } {
+    if (!args.note.trim()) throw new LedgerError("note_required", "a resolution note is required");
+    return transaction(this.db, () => {
+      const row = this.getTopup(args.topupId);
+      if (!row) throw new LedgerError("not_found", `unknown top-up ${args.topupId}`);
+      if (row.status === "settled") throw new LedgerError("already_settled", `top-up ${row.id} is already credited`);
+      const now = this.now();
+      if (args.action === "reject") {
+        this.q("UPDATE topups SET status = 'rejected', resolution = 'operator_reject', resolution_note = ?, resolved_at = ? WHERE id = ?")
+          .run(args.note.slice(0, 500), now, row.id);
+        return { topup: this.getTopup(row.id)!, credited: false };
+      }
+      if (row.status === "settling") throw new LedgerError("still_settling", `top-up ${row.id} is still settling; wait or let reconciliation flag it`);
+      const other = this.q("SELECT id FROM topups WHERE tx_signature = ? AND id != ? AND status = 'settled'")
+        .get(args.txSignature, row.id) as { id: string } | undefined;
+      if (other) throw new LedgerError("signature_already_credited", `signature already credited to top-up ${other.id}`);
+      this.q(
+        `UPDATE topups SET status = 'settled', wallet = ?, tx_signature = ?, settled_at = ?, error = NULL,
+           resolution = 'operator_credit', resolution_note = ?, resolved_at = ?
+         WHERE id = ? AND status != 'settled'`,
+      ).run(args.wallet, args.txSignature, now, args.note.slice(0, 500), now, row.id);
+      this.ensureAccount(args.wallet);
+      this.q("UPDATE accounts SET balance = balance + ?, total_topped_up = total_topped_up + ?, updated_at = ? WHERE wallet = ?")
+        .run(row.amount, row.amount, now, args.wallet);
+      this.q("INSERT INTO journal (wallet, kind, amount, ref, note, created_at) VALUES (?, 'topup', ?, ?, ?, ?)")
+        .run(args.wallet, row.amount, row.id, `operator credit ${args.txSignature}: ${args.note}`.slice(0, 500), now);
+      return { topup: this.getTopup(row.id)!, credited: true, balance: this.getAccount(args.wallet)!.balance };
     });
   }
 

@@ -80,8 +80,10 @@ All requests need `Authorization: Bearer $ADMIN_TOKEN`.
 |---|---|
 | `GET /admin/stats` | Funnel, revenue, credit estimate, upstreams |
 | `GET /admin/accounts/{wallet}` | Balance, journal, top-ups, refunds for one wallet |
-| `POST /admin/accounts/{wallet}/adjust` `{"amountUsd": 1.5, "note": "..."}` | Journaled manual credit (negative amounts debit) |
+| `POST /admin/accounts/{wallet}/adjust` `{"amountUsd": 1.5, "note": "..."}` | Journaled goodwill credit or debit. Never use it to recover a top-up; it is refused while the wallet has unresolved top-ups. |
 | `GET /admin/topups?status=needs_review` | Settlements that need a human |
+| `GET /admin/topups/{id}/verify` | On-chain evidence for a top-up: finalized, successful, amount received by `PAYTO_ADDRESS`, payer |
+| `POST /admin/topups/{id}/resolve` `{"action": "credit", "note": "..."}` | Credit the original receipt once, after the evidence matches. `"reject"` records that nothing moved. |
 | `GET /admin/refunds?status=requested` | Refund queue |
 | `POST /admin/refunds/{id}` `{"status": "paid", "txSignature": "..."}` | Record a refund payout (or `"rejected"` to re-credit) |
 | `POST /admin/reconcile` | Run reconciliation now |
@@ -90,7 +92,13 @@ All requests need `Authorization: Bearer $ADMIN_TOKEN`.
 
 ### A top-up is flagged `needs_review`
 
-Money may have moved without being credited. Look up the transaction signature (in the top-up row or the `top-up settled but not recorded` log line) on an explorer. If USDC reached `PAYTO_ADDRESS`, credit the payer with `POST /admin/accounts/{wallet}/adjust` and note the signature. If no transfer exists, nothing is owed.
+Money may have moved without being credited: the facilitator timed out, reported a pending settlement, or broadcast a transaction that was not confirmed. The payment is frozen, and resending the same signed payment is refused.
+
+1. Run `GET /admin/topups/{id}/verify`. If no signature is recorded, find it in the logs or on an explorer and pass `?txSignature=`.
+2. If `matches` is true (finalized, successful, the expected amount reached `PAYTO_ADDRESS`), resolve it with `POST /admin/topups/{id}/resolve` and `{"action": "credit", "note": "..."}`. This credits the original receipt exactly once, with the receipt's own amount. A delayed completion or replay of the same payment then credits nothing.
+3. If nothing landed, resolve it with `{"action": "reject", "note": "..."}`. If that payment settles later after all, it returns to review instead of crediting automatically.
+
+Never recover a top-up with a manual adjustment. An adjustment is not linked to the receipt, so a later completion of the same payment would credit it a second time. `"force": true` skips the on-chain check and is for the rare case where the evidence must come from elsewhere; it requires `wallet` and a note.
 
 ### A refund is requested
 

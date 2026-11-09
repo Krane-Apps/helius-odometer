@@ -12,6 +12,10 @@ export class FakeFacilitator implements FacilitatorClient {
   readonly settled = new Map<string, string>();
   settleCalls = 0;
   failNextSettle?: string;
+  /** Next settle fails but reports a broadcast transaction (outcome unknown). */
+  failNextSettleWithTransaction?: { reason: string; transaction: string };
+  /** Next settle throws this error (e.g. a FacilitatorTimeoutError). */
+  throwOnNextSettle?: Error;
 
   constructor(private readonly network: string) {}
 
@@ -32,6 +36,16 @@ export class FakeFacilitator implements FacilitatorClient {
     this.settleCalls += 1;
     const parsed = parse(payload);
     if (!parsed) return { success: false, errorReason: "invalid_payload", transaction: "", network: req.network };
+    if (this.throwOnNextSettle) {
+      const err = this.throwOnNextSettle;
+      this.throwOnNextSettle = undefined;
+      throw err;
+    }
+    if (this.failNextSettleWithTransaction) {
+      const f = this.failNextSettleWithTransaction;
+      this.failNextSettleWithTransaction = undefined;
+      return { success: false, errorReason: f.reason, transaction: f.transaction, network: req.network, payer: parsed.wallet };
+    }
     if (this.failNextSettle) {
       const reason = this.failNextSettle;
       this.failNextSettle = undefined;
