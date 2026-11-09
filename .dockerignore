@@ -1,0 +1,14 @@
+node_modules
+dist
+data
+.localnet
+.env
+.env.*
+coverage
+test
+dev
+scripts
+docs
+*.db
+*.log
+.git
