@@ -62,7 +62,8 @@ export interface Config {
   maxBodyBytes: number;
   walletRps: number;
   ipRps: number;
-  walletDailyCapUsd: number;
+  /** Operator ceiling per wallet per UTC day; null means no ceiling. */
+  walletDailyCapUsd: number | null;
   defaultCommitment: Record<Tier, Commitment | undefined>;
   minContextSlotMargin: number;
   sendPreflightCommitment?: Commitment;
@@ -136,7 +137,19 @@ const EnvSchema = z.object({
   MAX_BODY_BYTES: int(262_144),
   WALLET_RPS: int(25),
   IP_RPS: int(20),
-  WALLET_DAILY_CAP_USD: int(10),
+  WALLET_DAILY_CAP_USD: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v === "") return 10;
+      if (["none", "unlimited"].includes(v.toLowerCase())) return null;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) {
+        ctx.addIssue({ code: "custom", message: `expected a positive USD amount or "none", got ${v}` });
+        return z.NEVER;
+      }
+      return n;
+    }),
   ECONOMY_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
   STANDARD_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
   FAST_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("none"),

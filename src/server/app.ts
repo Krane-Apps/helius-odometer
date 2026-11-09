@@ -50,7 +50,10 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
   const { config } = opts;
   const logger = opts.logger ?? createLogger(config.logLevel, { service: "helius-odometer" });
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const ledger = new Ledger({ path: config.databasePath, defaultDailyCap: usdToMicros(config.walletDailyCapUsd) });
+  const ledger = new Ledger({
+    path: config.databasePath,
+    defaultDailyCap: config.walletDailyCapUsd === null ? null : usdToMicros(config.walletDailyCapUsd),
+  });
 
   const publics = config.publicUpstreams.map((u) => new Upstream({ ...u, kind: "public" }, fetchImpl));
   const helius = config.helius ? new Upstream({ ...config.helius, kind: "helius" }, fetchImpl) : undefined;

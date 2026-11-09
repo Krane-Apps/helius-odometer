@@ -65,7 +65,7 @@ async function runGateway(upstreamUrl: string): Promise<void> {
       SESSION_SECRET: "load-test-secret-load-test-secret-0123",
       PUBLIC_UPSTREAMS: JSON.stringify([{ id: "mock", url: upstreamUrl, rps: 0 }]),
       WALLET_RPS: "1000000",
-      WALLET_DAILY_CAP_USD: "0",
+      WALLET_DAILY_CAP_USD: "none",
       HEALTH_POLL_MS: "600000",
       LOG_LEVEL: "error",
     });

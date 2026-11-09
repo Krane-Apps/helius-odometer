@@ -192,13 +192,19 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
   app.post("/v1/account/cap", async (c) => {
     const auth = await resolveWallet(c, deps);
     if (!auth.ok) return jsonResponse(c, auth.status, auth.body);
-    const body = (await c.req.json().catch(() => ({}))) as { dailyCapUsd?: number | null };
+    const body = (await c.req.json().catch(() => undefined)) as { dailyCapUsd?: number | null } | undefined;
+    if (!body || !("dailyCapUsd" in body)) {
+      return jsonResponse(c, 400, {
+        error: "invalid_cap",
+        message: "Send {\"dailyCapUsd\": <USD>} to set a cap, 0 to stop spending, or null to remove your own cap",
+      });
+    }
     let cap: number | null = null;
-    if (body.dailyCapUsd !== null && body.dailyCapUsd !== undefined) {
+    if (body.dailyCapUsd !== null) {
       try {
-        cap = usdToMicros(body.dailyCapUsd);
+        cap = usdToMicros(body.dailyCapUsd as number);
       } catch {
-        return jsonResponse(c, 400, { error: "invalid_cap" });
+        return jsonResponse(c, 400, { error: "invalid_cap", message: "dailyCapUsd must be a non-negative USD amount or null" });
       }
     }
     deps.ledger.setDailyCap(auth.wallet, cap);
@@ -216,6 +222,8 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
 export function accountView(deps: AppDeps, wallet: string): Record<string, unknown> {
   const account = deps.ledger.getAccount(wallet);
   const cap = deps.ledger.effectiveDailyCap(account);
+  const operatorCap = deps.ledger.operatorDailyCap();
+  const ownCap = account?.dailyCap ?? null;
   const spentToday = deps.ledger.spentToday(wallet);
   return {
     wallet,
@@ -223,7 +231,10 @@ export function accountView(deps: AppDeps, wallet: string): Record<string, unkno
     availableMicros: account?.available ?? 0,
     reservedMicros: account?.reserved ?? 0,
     availableUsd: microsToUsd(account?.available ?? 0),
-    dailyCapUsd: cap > 0 ? microsToUsd(cap) : null,
+    dailyCapUsd: cap === null ? null : microsToUsd(cap),
+    walletCapUsd: ownCap === null ? null : microsToUsd(ownCap),
+    operatorCapUsd: operatorCap === null ? null : microsToUsd(operatorCap),
+    spendingStopped: cap === 0,
     spentTodayUsd: microsToUsd(spentToday),
     totalToppedUpUsd: microsToUsd(account?.totalToppedUp ?? 0),
     totalSpentUsd: microsToUsd(account?.totalSpent ?? 0),

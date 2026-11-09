@@ -56,8 +56,11 @@ export interface ReconcileReport {
 
 export interface LedgerOptions {
   path: string;
-  /** Default per-wallet daily spend cap in micros; 0 disables the cap. */
-  defaultDailyCap: Micros;
+  /**
+   * Operator ceiling on what any wallet may spend per UTC day, in micros.
+   * `null` means no operator ceiling; `0` means nobody may spend.
+   */
+  defaultDailyCap: Micros | null;
   now?: () => number;
 }
 
@@ -88,7 +91,7 @@ const DAY_MS = 86_400_000;
 export class Ledger {
   readonly db: Db;
   private readonly now: () => number;
-  private readonly defaultDailyCap: Micros;
+  private readonly defaultDailyCap: Micros | null;
 
   /** Prepared statements are compiled once and reused; preparing per call dominated CPU time. */
   private readonly statements = new Map<string, StatementSync>();
@@ -133,11 +136,18 @@ export class Ledger {
     return row?.spent ?? 0;
   }
 
-  effectiveDailyCap(account: Pick<Account, "dailyCap"> | undefined): Micros {
-    const own = account?.dailyCap;
-    if (own === null || own === undefined) return this.defaultDailyCap;
-    if (this.defaultDailyCap > 0) return Math.min(own, this.defaultDailyCap);
-    return own;
+  /**
+   * The cap that applies to a wallet today: the tighter of the operator ceiling
+   * and the wallet's own cap. `null` means unlimited; `0` means no spending.
+   * A wallet's own cap can only tighten the operator ceiling, never remove it.
+   */
+  effectiveDailyCap(account: Pick<Account, "dailyCap"> | undefined): Micros | null {
+    const caps = [this.defaultDailyCap, account?.dailyCap ?? null].filter((c): c is Micros => c !== null);
+    return caps.length ? Math.min(...caps) : null;
+  }
+
+  operatorDailyCap(): Micros | null {
+    return this.defaultDailyCap;
   }
 
   private ensureAccount(wallet: string): void {
@@ -146,8 +156,12 @@ export class Ledger {
       .run(wallet, now, now);
   }
 
-  /** Sets a wallet's own daily cap (null resets to the gateway default). */
+  /**
+   * Sets a wallet's own daily cap: a positive amount, `0` to stop spending, or
+   * `null` to remove the wallet's own cap (the operator ceiling still applies).
+   */
   setDailyCap(wallet: string, cap: Micros | null): Account {
+    if (cap !== null && !(Number.isInteger(cap) && cap >= 0)) throw new LedgerError("invalid_cap", "cap must be a non-negative integer or null");
     return transaction(this.db, () => {
       this.ensureAccount(wallet);
       this.q("UPDATE accounts SET daily_cap = ?, updated_at = ? WHERE wallet = ?").run(cap, this.now(), wallet);
@@ -283,7 +297,7 @@ export class Ledger {
       if (!account || available < args.amount) return { ok: false, reason: "insufficient_balance", available };
       const cap = this.effectiveDailyCap(account);
       const spentToday = this.spentToday(args.wallet);
-      if (cap > 0 && spentToday + account.reserved + args.amount > cap) {
+      if (cap !== null && spentToday + account.reserved + args.amount > cap) {
         return { ok: false, reason: "daily_cap_exceeded", available, cap, spentToday };
       }
       const id = newId("res");
