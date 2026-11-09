@@ -133,7 +133,8 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
       return "unknown";
     }
   };
-  const paywall = new Paywall({ payments, ledger, sessions, siwx, logger, clientIp });
+  const ipLimiter = new KeyedRateLimiter(config.ipRps, Math.max(1, config.ipRps * 2));
+  const paywall = new Paywall({ payments, ledger, sessions, siwx, logger, clientIp, challengeLimiter: ipLimiter });
   const counters: Counters = {
     calls: 0,
     billableCalls: 0,
@@ -162,7 +163,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
     sessions,
     siwx,
     walletLimiter: new KeyedRateLimiter(config.walletRps, Math.max(1, config.walletRps * 2)),
-    ipLimiter: new KeyedRateLimiter(config.ipRps, Math.max(1, config.ipRps * 2)),
+    ipLimiter,
     bootstrapLimiter: new KeyedRateLimiter(1, 20),
     blockhashes,
     rebroadcaster,

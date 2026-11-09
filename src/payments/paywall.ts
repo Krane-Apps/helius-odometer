@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
 import type { Ledger } from "../ledger/ledger.js";
 import type { Logger } from "../util/log.js";
+import type { KeyedRateLimiter } from "../util/token-bucket.js";
 import { sha256Hex } from "../util/json.js";
 import type { Micros } from "../util/money.js";
 import { bearerToken, type SessionManager } from "./session.js";
@@ -32,6 +33,8 @@ export interface PaywallDeps {
   siwx: SiwxAuth;
   logger: Logger;
   clientIp: (c: Context) => string;
+  /** Limits 402 challenges per client IP. */
+  challengeLimiter?: KeyedRateLimiter;
 }
 
 /** Re-issue a session when it has less than this left. */
@@ -91,6 +94,15 @@ export class Paywall {
       challenge.available = available;
     }
 
+    const limited = this.deps.challengeLimiter?.tryTake(this.deps.clientIp(c));
+    if (limited && !limited.ok) {
+      return {
+        kind: "respond",
+        status: 429,
+        headers: { "retry-after": String(Math.max(1, Math.ceil(limited.retryAfterMs / 1000))) },
+        body: { error: "rate_limited", message: "Too many payment challenges from this address; not charged" },
+      };
+    }
     if (!payments.initialized) {
       try {
         await withTimeout(payments.initialize(), 5000);

@@ -60,20 +60,6 @@ export async function metered(c: Context, deps: AppDeps, args: MeteredArgs): Pro
     }
   }
 
-  const hasCredentials =
-    !!c.req.header("authorization") || !!c.req.header("sign-in-with-x") || !!c.req.header("payment-signature") || !!c.req.header("x-payment");
-  if (!hasCredentials) {
-    const limited = deps.ipLimiter.tryTake(deps.clientIp(c));
-    if (!limited.ok) {
-      return jsonResponse(
-        c,
-        429,
-        { error: "rate_limited", message: "Too many unauthenticated requests from this address" },
-        { ...base, "retry-after": String(Math.ceil(limited.retryAfterMs / 1000)) },
-      );
-    }
-  }
-
   const auth = await paywall.authorize(c, args.price, args.body);
   if (auth.kind === "respond") {
     if (auth.status === 402) deps.counters.challenges += 1;
@@ -90,7 +76,8 @@ export async function metered(c: Context, deps: AppDeps, args: MeteredArgs): Pro
   if (auth.paymentHeaders) Object.assign(extra, auth.paymentHeaders);
   if (auth.toppedUp) deps.counters.topups += 1;
 
-  const limited = deps.walletLimiter.tryTake(wallet);
+  // A batch spends one rate-limit token per call, capped at the bucket size so it can always pass eventually.
+  const limited = deps.walletLimiter.tryTake(wallet, Math.min(Math.max(1, args.methods.length), deps.walletLimiter.capacity));
   if (!limited.ok) {
     return jsonResponse(
       c,

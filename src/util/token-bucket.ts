@@ -62,6 +62,11 @@ export class KeyedRateLimiter {
     private readonly maxKeys = 100_000,
   ) {}
 
+  /** Largest number of tokens one key can spend at once. */
+  get capacity(): number {
+    return this.burst;
+  }
+
   tryTake(key: string, n = 1, now = Date.now()): { ok: boolean; retryAfterMs: number } {
     if (!(this.rate > 0)) return { ok: true, retryAfterMs: 0 };
     let bucket = this.buckets.get(key);
