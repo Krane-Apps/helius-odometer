@@ -217,7 +217,11 @@ export function toMarkdown(report: BenchReport): string {
   return lines.join("\n") + "\n";
 }
 
-/** Parses `getBalance:<address>` style method specs into calls. */
+/**
+ * Parses `getBalance:<address>` style method specs into calls. Every built-in
+ * workload pins `confirmed`, so upstreams and tiers are compared at the same
+ * commitment (an upstream default of `finalized` would lag by ~13 s).
+ */
 export function parseCalls(specs: string[], address: string): BenchCall[] {
   return specs.map((spec) => {
     const [method, arg] = spec.split(":") as [string, string | undefined];
@@ -228,9 +232,9 @@ export function parseCalls(specs: string[], address: string): BenchCall[] {
       case "getAccountInfo":
         return { method, params: [target, { encoding: "base64", commitment: "confirmed" }] };
       case "getSignaturesForAddress":
-        return { method, params: [target, { limit: 10 }] };
+        return { method, params: [target, { limit: 10, commitment: "confirmed" }] };
       case "getTokenAccountsByOwner":
-        return { method, params: [target, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }] };
+        return { method, params: [target, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed", commitment: "confirmed" }] };
       case "getLatestBlockhash":
       case "getSlot":
       case "getBlockHeight":

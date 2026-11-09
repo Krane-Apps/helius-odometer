@@ -165,7 +165,9 @@ const EnvSchema = z.object({
     }),
   ECONOMY_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
   STANDARD_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
-  FAST_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("none"),
+  // All tiers default to the same commitment, so one request means the same data on
+  // every tier and tier benchmarks compare like with like.
+  FAST_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
   MIN_CONTEXT_SLOT_MARGIN: int(4),
   SEND_PREFLIGHT_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
 

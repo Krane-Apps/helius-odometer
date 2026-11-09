@@ -88,7 +88,7 @@ Anything not in the catalog is refused with `-32601`, so the gateway is never an
 
 `src/routing/consistency.ts`:
 
-- **Commitment normalization.** When the caller set none, economy and standard inject `confirmed` (configurable per tier) for state reads. `getTransaction` and `getBlock` keep the Solana default of `finalized`, which keeps them cacheable.
+- **Commitment normalization.** When the caller set none, every tier injects `confirmed` for state reads (configurable per tier with `ECONOMY_COMMITMENT`, `STANDARD_COMMITMENT`, `FAST_COMMITMENT`), so the same request means the same data on every tier. `getTransaction` and `getBlock` keep the Solana default of `finalized`, which keeps them cacheable. Benchmarks pin `confirmed` on every workload for the same reason.
 - **Monotonic reads.** The gateway keeps a high-water mark of `context.slot` per wallet and per commitment. On multi-upstream tiers it injects `minContextSlot = mark - MIN_CONTEXT_SLOT_MARGIN` (default 4), so a wallet never reads older state than it already saw. Marks expire after 30 s. An upstream answering `-32016` is retried elsewhere.
 - **Preflight.** `sendTransaction` defaults `preflightCommitment` to `confirmed` when the caller set none and did not skip preflight. Solana's default of `finalized` rejects blockhashes fetched at `confirmed`, which is exactly what the gateway normalizes `getLatestBlockhash` to.
 - **Sticky transaction follow-ups.** For 90 s after a wallet sends a transaction, its standard-tier `getSignatureStatuses`, `getLatestBlockhash`, `getBlockHeight`, `isBlockhashValid` and `getTransaction` go to Helius, the upstream that saw the transaction.
