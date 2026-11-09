@@ -23,8 +23,19 @@ export interface OdometerClientOptions {
   topupUsd?: number;
   /** Refuse any single top-up above this (default $5). */
   maxTopupUsd?: number;
-  /** Refuse further top-ups once this client has paid this much in total (default $20). */
+  /**
+   * Refuse further top-ups once this client has authorized this much in total (default $20).
+   * Counted when a payment is signed, including payments whose response was lost.
+   */
   maxSpendUsd?: number;
+  /** Top-ups authorized before this client was created, in micros (e.g. restored from storage). */
+  initialSpentMicros?: number;
+  /**
+   * Called with the new running total in micros whenever the budget changes, before any payment
+   * is signed. Persist it to make maxSpendUsd survive restarts; without it the total starts from
+   * `initialSpentMicros` (default 0) every time a client is created.
+   */
+  onSpendChange?: (totalMicros: number) => void;
   /** RPC used to build payment transactions (default: the gateway's free /v1/bootstrap). */
   paymentRpcUrl?: string;
   /**
@@ -87,10 +98,17 @@ export class OdometerClient {
   private readonly http: x402HTTPClient;
   private session?: { token: string; expiresAt: number };
   private signingIn?: Promise<void>;
-  /** Total paid in top-ups by this client instance, in micros. */
-  spentOnTopupsMicros = 0;
+  /**
+   * Top-ups authorized so far, in micros: reserved before signing and never released once a
+   * signed payment exists, because a lost response does not mean the payment did not settle.
+   */
+  spentOnTopupsMicros: number;
+  /** Serializes top-ups so concurrent calls never sign more than one payment at a time. */
+  private topupQueue: Promise<void> = Promise.resolve();
+  private topupGeneration = 0;
 
   constructor(readonly opts: OdometerClientOptions) {
+    this.spentOnTopupsMicros = opts.initialSpentMicros ?? 0;
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.fetchImpl = opts.fetch ?? fetch;
     this.payer = new x402Client()
@@ -179,15 +197,17 @@ export class OdometerClient {
 
   /** Pays a top-up now (without making a call). */
   async topup(usd?: number): Promise<Record<string, unknown>> {
-    const first = await this.fetchImpl(`${this.baseUrl}/v1/topup`, { method: "POST" });
-    if (first.status !== 402) throw new OdometerError("unexpected_response", `expected 402, got ${first.status}`);
-    const pr = this.readPaymentRequired(first, await first.json().catch(() => undefined));
-    const headers = await this.paymentHeaders(pr, usd);
-    const res = await this.fetchImpl(`${this.baseUrl}/v1/topup`, { method: "POST", headers });
-    const body = (await res.json()) as Record<string, unknown>;
-    this.captureSession(res);
-    if (!res.ok) throw new OdometerError(String(body.error ?? "topup_failed"), `top-up failed: ${res.status}`, body);
-    return body;
+    return this.withTopupLock(async () => {
+      const first = await this.fetchImpl(`${this.baseUrl}/v1/topup`, { method: "POST" });
+      if (first.status !== 402) throw new OdometerError("unexpected_response", `expected 402, got ${first.status}`);
+      const pr = this.readPaymentRequired(first, await first.json().catch(() => undefined));
+      const headers = await this.paymentHeaders(pr, usd);
+      const res = await this.fetchImpl(`${this.baseUrl}/v1/topup`, { method: "POST", headers });
+      const body = (await res.json()) as Record<string, unknown>;
+      this.captureSession(res);
+      if (!res.ok) throw new OdometerError(String(body.error ?? "topup_failed"), `top-up failed: ${res.status}`, body);
+      return body;
+    });
   }
 
   /** Low-level send with sign-in, session reuse and automatic top-up. */
@@ -224,10 +244,25 @@ export class OdometerClient {
       if (this.opts.autoTopup === false) {
         throw new OdometerError(err?.error ?? "payment_required", err?.message ?? "payment required", parsed);
       }
-      const pr = this.readPaymentRequired(res, parsed);
-      const payment = await this.paymentHeaders(pr, this.opts.topupUsd);
-      res = await post({ ...withSession(), ...payment });
-      parsed = await readJson(res);
+      const challenge = { res, parsed };
+      const outcome = await this.withTopupLock(async (anotherTopupCompleted) => {
+        if (anotherTopupCompleted) {
+          // A concurrent call topped up while this one waited: try the new balance first.
+          const retry = await post(withSession());
+          const retryParsed = await readJson(retry);
+          if (retry.status !== 402) return { res: retry, parsed: retryParsed };
+          challenge.res = retry;
+          challenge.parsed = retryParsed;
+        }
+        const pr = this.readPaymentRequired(challenge.res, challenge.parsed);
+        const payment = await this.paymentHeaders(pr, this.opts.topupUsd);
+        const paid = await post({ ...withSession(), ...payment });
+        const paidParsed = await readJson(paid);
+        this.captureSession(paid);
+        return { res: paid, parsed: paidParsed };
+      });
+      res = outcome.res;
+      parsed = outcome.parsed;
     }
     this.captureSession(res);
     if (res.status === 402) {
@@ -277,9 +312,40 @@ export class OdometerClient {
 
   private async paymentHeaders(pr: PaymentRequired, preferredUsd?: number): Promise<Record<string, string>> {
     const chosen = this.chooseRequirement(pr, preferredUsd);
-    const payload = await this.payer.createPaymentPayload({ ...pr, accepts: [chosen] });
-    this.spentOnTopupsMicros += Number(chosen.amount);
+    const amount = Number(chosen.amount);
+    // Reserve the budget in the same tick as the check, before any await, so concurrent
+    // callers can never both pass the check with the old total.
+    this.spentOnTopupsMicros += amount;
+    this.opts.onSpendChange?.(this.spentOnTopupsMicros);
+    let payload;
+    try {
+      payload = await this.payer.createPaymentPayload({ ...pr, accepts: [chosen] });
+    } catch (err) {
+      // Signing failed, so no authorization exists and the reservation can be returned.
+      this.spentOnTopupsMicros -= amount;
+      this.opts.onSpendChange?.(this.spentOnTopupsMicros);
+      throw err;
+    }
+    // From here on a signed payment exists: it stays counted even if the response is lost.
     return this.http.encodePaymentSignatureHeader(payload);
+  }
+
+  /**
+   * Runs one top-up at a time. The callback learns whether another top-up completed while
+   * it waited, so it can retry with the new balance instead of paying again.
+   */
+  private async withTopupLock<T>(fn: (anotherTopupCompleted: boolean) => Promise<T>): Promise<T> {
+    const generationAtStart = this.topupGeneration;
+    const previous = this.topupQueue;
+    let release!: () => void;
+    this.topupQueue = new Promise<void>((resolve) => (release = resolve));
+    await previous;
+    try {
+      return await fn(this.topupGeneration !== generationAtStart);
+    } finally {
+      this.topupGeneration += 1;
+      release();
+    }
   }
 
   private captureSession(res: Response): void {

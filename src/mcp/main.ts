@@ -5,13 +5,17 @@
  *   ODOMETER_URL            gateway origin (required)
  *   ODOMETER_WALLET_KEY     keypair file path, JSON byte array or base58 secret key (required)
  *   ODOMETER_MAX_TOPUP_USD  largest single top-up allowed (default 5)
- *   ODOMETER_MAX_SPEND_USD  total top-ups allowed per process (default 20)
+ *   ODOMETER_MAX_SPEND_USD  total top-ups allowed (default 20; per process unless
+ *                           ODOMETER_SPEND_FILE is set)
  *   ODOMETER_TOPUP_USD      preferred top-up denomination
  *   ODOMETER_AUTO_TOPUP     "false" to never pay automatically
  *   ODOMETER_ALLOWED_ASSETS comma list of extra payment mints (test mints only)
+ *   ODOMETER_SPEND_FILE     file that persists the running top-up total, so
+ *                           ODOMETER_MAX_SPEND_USD survives restarts (recommended)
  *
  * stdout carries the MCP protocol; diagnostics go to stderr.
  */
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { OdometerClient } from "../client/index.js";
 import { loadKeypair } from "../util/keypair.js";
@@ -38,7 +42,11 @@ async function main(): Promise<void> {
     .map((s) => s.trim())
     .filter(Boolean)
     .map((asset) => ({ network: index.network, asset }));
+  const spendFile = process.env.ODOMETER_SPEND_FILE;
+  const initialSpentMicros = spendFile ? readSpent(spendFile, signer.address) : 0;
   const client = new OdometerClient({
+    initialSpentMicros,
+    onSpendChange: spendFile ? (total) => writeSpent(spendFile, signer.address, total) : undefined,
     baseUrl,
     signer,
     autoTopup: process.env.ODOMETER_AUTO_TOPUP !== "false",
@@ -50,6 +58,21 @@ async function main(): Promise<void> {
   const server = createOdometerMcpServer(client, index);
   await server.connect(new StdioServerTransport());
   process.stderr.write(`helius-odometer MCP ready: wallet ${signer.address}, tiers ${index.tiers.map((t) => t.tier).join(",")}\n`);
+}
+
+/** Reads the persisted top-up total for this wallet (0 if none). */
+function readSpent(file: string, wallet: string): number {
+  if (!existsSync(file)) return 0;
+  const data = JSON.parse(readFileSync(file, "utf8")) as { wallet?: string; totalMicros?: number };
+  if (data.wallet && data.wallet !== wallet) throw new Error(`${file} belongs to wallet ${data.wallet}, not ${wallet}`);
+  return Number.isSafeInteger(data.totalMicros) && (data.totalMicros ?? 0) >= 0 ? (data.totalMicros as number) : 0;
+}
+
+/** Persists the running total atomically (write then rename) before a payment is signed. */
+function writeSpent(file: string, wallet: string, totalMicros: number): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ wallet, totalMicros, updatedAt: new Date().toISOString() }));
+  renameSync(tmp, file);
 }
 
 main().catch((err) => {
