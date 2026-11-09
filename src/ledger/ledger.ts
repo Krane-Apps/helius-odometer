@@ -27,6 +27,27 @@ export type ReserveResult =
   | { ok: false; reason: "insufficient_balance"; available: Micros }
   | { ok: false; reason: "daily_cap_exceeded"; available: Micros; cap: Micros; spentToday: Micros };
 
+/**
+ * The replay receipt written in the same transaction as a request's debit, so
+ * a crash can never leave a charged request without its stored response.
+ */
+export type FinalizeReceipt =
+  | { wallet: string; key: string; requestId: string; status: number; headers: Record<string, string>; body: string }
+  | { wallet: string; key: string; requestId: string; abort: true };
+
+export interface RequestReceipt {
+  requestId: string | null;
+  /** in_flight: still running (or interrupted before charging); charged; not_charged. */
+  state: "in_flight" | "charged" | "not_charged";
+  chargedMicros: number;
+  tier?: string;
+  methods?: string[];
+  idempotencyKey?: string;
+  httpStatus?: number | null;
+  createdAt: number;
+  resolvedAt?: number | null;
+}
+
 export type IdempotencyBegin =
   | { state: "new" }
   | { state: "replay"; status: number; headers: Record<string, string>; body: string }
@@ -317,7 +338,12 @@ export class Ledger {
    * Debits `charged` (capped at the reserved amount) and releases the rest.
    * Safe to call twice: a resolved reservation is left untouched.
    */
-  finalize(reservationId: string, charged: Micros, calls = 1): { charged: Micros; balance: Micros; available: Micros } {
+  finalize(
+    reservationId: string,
+    charged: Micros,
+    calls = 1,
+    receipt?: FinalizeReceipt,
+  ): { charged: Micros; balance: Micros; available: Micros } {
     return transaction(this.db, () => {
       const res = this.q("SELECT wallet, amount, status, charged FROM reservations WHERE id = ?")
         .get(reservationId) as { wallet: string; amount: number; status: string; charged: number } | undefined;
@@ -344,13 +370,32 @@ export class Ledger {
            ON CONFLICT (wallet, day) DO UPDATE SET calls = calls + excluded.calls, spent = spent + excluded.spent`,
         )
         .run(res.wallet, this.day(now), amount > 0 ? calls : 0, amount);
+      if (receipt) this.writeReceipt(receipt, amount);
       const acct = this.getAccount(res.wallet)!;
       return { charged: amount, balance: acct.balance, available: acct.available };
     });
   }
 
-  release(reservationId: string): void {
+  /** Stores (or aborts) an idempotency receipt; must run inside the debit's transaction. */
+  private writeReceipt(receipt: FinalizeReceipt, charged: Micros): void {
+    // A charged request always keeps its receipt, so a retry can never be charged twice.
+    if ("abort" in receipt && charged === 0) {
+      this.q("UPDATE idempotency SET status = 'aborted', request_id = ?, charged = 0 WHERE wallet = ? AND key = ? AND status = 'in_flight'")
+        .run(receipt.requestId, receipt.wallet, receipt.key);
+      return;
+    }
+    const status = "abort" in receipt ? 500 : receipt.status;
+    const headers = "abort" in receipt ? {} : receipt.headers;
+    const body = "abort" in receipt ? JSON.stringify({ error: "request_failed_after_charge", requestId: receipt.requestId }) : receipt.body;
+    this.q(
+      `UPDATE idempotency SET status = 'done', http_status = ?, headers = ?, body = ?, request_id = ?, charged = ?
+       WHERE wallet = ? AND key = ? AND status = 'in_flight'`,
+    ).run(status, JSON.stringify(headers), body, receipt.requestId, charged, receipt.wallet, receipt.key);
+  }
+
+  release(reservationId: string, receipt?: { wallet: string; key: string; requestId: string }): void {
     transaction(this.db, () => {
+      if (receipt) this.writeReceipt({ ...receipt, abort: true }, 0);
       const res = this.q("SELECT wallet, amount, status FROM reservations WHERE id = ?").get(reservationId) as
         | { wallet: string; amount: number; status: string }
         | undefined;
@@ -388,6 +433,11 @@ export class Ledger {
         return { state: "new" };
       }
       if (row.request_hash !== requestHash) return { state: "mismatch" };
+      if (row.status === "aborted") {
+        // The earlier attempt was never charged (it failed, or the process restarted first): run it again.
+        this.q("UPDATE idempotency SET status = 'in_flight', created_at = ? WHERE wallet = ? AND key = ?").run(this.now(), wallet, key);
+        return { state: "new" };
+      }
       if (row.status !== "done") return { state: "in_flight" };
       return {
         state: "replay",
@@ -404,7 +454,112 @@ export class Ledger {
   }
 
   idempotencyAbort(wallet: string, key: string): void {
-    this.q("DELETE FROM idempotency WHERE wallet = ? AND key = ? AND status = 'in_flight'").run(wallet, key);
+    this.q("UPDATE idempotency SET status = 'aborted' WHERE wallet = ? AND key = ? AND status = 'in_flight'").run(wallet, key);
+  }
+
+  /**
+   * What happened to a request, by the gateway's request id or by the caller's
+   * idempotency key. Lets a client whose response was lost find out whether it
+   * was charged, and replay it with the same key to get the stored response.
+   */
+  getReceipt(wallet: string, by: { requestId: string } | { idempotencyKey: string }): RequestReceipt | undefined {
+    let requestId: string | null;
+    let idem: { key: string; status: string; http_status: number | null; charged: number | null; created_at: number } | undefined;
+    if ("idempotencyKey" in by) {
+      const row = this.q("SELECT key, status, http_status, charged, created_at, request_id FROM idempotency WHERE wallet = ? AND key = ?")
+        .get(wallet, by.idempotencyKey) as (typeof idem & { request_id: string | null }) | undefined;
+      if (!row) return undefined;
+      idem = row;
+      requestId = row.request_id;
+    } else {
+      requestId = by.requestId;
+    }
+    const res = requestId
+      ? (this.q("SELECT request_id, status, charged, tier, methods, created_at, resolved_at FROM reservations WHERE request_id = ? AND wallet = ?")
+          .get(requestId, wallet) as
+          | { request_id: string; status: string; charged: number; tier: string; methods: string; created_at: number; resolved_at: number | null }
+          | undefined)
+      : undefined;
+    if (!res && !idem) return undefined;
+    const state: RequestReceipt["state"] = res
+      ? res.status === "reserved"
+        ? "in_flight"
+        : res.charged > 0
+          ? "charged"
+          : "not_charged"
+      : idem!.status === "in_flight"
+        ? "in_flight"
+        : (idem!.charged ?? 0) > 0
+          ? "charged"
+          : "not_charged";
+    return {
+      requestId: requestId ?? null,
+      state,
+      chargedMicros: res?.charged ?? idem?.charged ?? 0,
+      tier: res?.tier,
+      methods: res?.methods ? res.methods.split(",") : undefined,
+      idempotencyKey: idem?.key,
+      httpStatus: idem?.http_status,
+      createdAt: res?.created_at ?? idem!.created_at,
+      resolvedAt: res?.resolved_at,
+    };
+  }
+
+  /**
+   * Startup recovery after a crash or restart: open reservations can never be
+   * finalized, so they are released (not charged), and their idempotency keys
+   * are marked aborted so the same request can be retried.
+   */
+  recoverAfterRestart(): { releasedReservations: number; abortedReceipts: number } {
+    const released = this.releaseStaleReservations(0);
+    const aborted = Number(this.q("UPDATE idempotency SET status = 'aborted' WHERE status = 'in_flight'").run().changes);
+    return { releasedReservations: released, abortedReceipts: aborted };
+  }
+
+  /** Drops resolved reservations older than the cutoff; debits stay in the journal. */
+  pruneReservations(olderThanMs: number): number {
+    return Number(
+      this.q("DELETE FROM reservations WHERE status != 'reserved' AND created_at < ?").run(this.now() - olderThanMs).changes,
+    );
+  }
+
+  // ------------------------------------------------------- single writer
+
+  /**
+   * Claims the ledger for one gateway process. SQLite plus in-memory sessions,
+   * rate limits and reservations assume a single writer; a second live process
+   * against the same database is refused instead of silently racing it.
+   */
+  acquireWriterLock(owner: string, staleMs = 30_000): void {
+    transaction(this.db, () => {
+      const row = this.q("SELECT owner, heartbeat_at FROM instance_lock WHERE id = 1").get() as
+        | { owner: string; heartbeat_at: number }
+        | undefined;
+      const now = this.now();
+      if (row && row.owner !== owner && now - row.heartbeat_at < staleMs) {
+        throw new LedgerError(
+          "ledger_locked",
+          `Another gateway process (${row.owner}) is using this ledger; its heartbeat is ${Math.round((now - row.heartbeat_at) / 1000)}s old. Run one writer per database.`,
+        );
+      }
+      this.q(
+        "INSERT INTO instance_lock (id, owner, heartbeat_at) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, heartbeat_at = excluded.heartbeat_at",
+      ).run(owner, now);
+    });
+  }
+
+  /** Refreshes the writer lock; returns false if another process took it over. */
+  heartbeatWriterLock(owner: string): boolean {
+    return Number(this.q("UPDATE instance_lock SET heartbeat_at = ? WHERE id = 1 AND owner = ?").run(this.now(), owner).changes) === 1;
+  }
+
+  releaseWriterLock(owner: string): void {
+    this.q("DELETE FROM instance_lock WHERE id = 1 AND owner = ?").run(owner);
+  }
+
+  /** Writes a consistent snapshot of the whole ledger to `path` (SQLite VACUUM INTO). */
+  backup(path: string): void {
+    this.db.prepare("VACUUM INTO ?").run(path);
   }
 
   pruneIdempotency(olderThanMs = DAY_MS): number {

@@ -50,6 +50,8 @@ export interface AppDeps {
   rebroadcaster: Rebroadcaster;
   bootstrapCache: LruCache<string, unknown>;
   counters: Counters;
+  /** Run when a wallet revokes its sessions (e.g. to terminate its remote MCP sessions). */
+  walletRevocationHooks: Array<(wallet: string) => Promise<void> | void>;
   startedAt: number;
   clientIp: (c: Context) => string;
 }

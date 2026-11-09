@@ -78,6 +78,14 @@ export interface Config {
   adminToken?: string;
   bootstrapEnabled: boolean;
   remoteMcpEnabled: boolean;
+  /** Absolute lifetime of a remote MCP session's spending binding. */
+  remoteMcpSessionTtlSeconds: number;
+  /** Remote MCP spending binding only works from the IP that paid. */
+  remoteMcpBindIp: boolean;
+  remoteMcpSessionsPerMinute: number;
+  remoteMcpMaxSessions: number;
+  /** Public display name (402 metadata, docs, MCP). Keep neutral until branding is approved. */
+  serviceName: string;
   bazaarEnabled: boolean;
 }
 
@@ -168,6 +176,11 @@ const EnvSchema = z.object({
   ADMIN_TOKEN: z.string().min(16).optional(),
   BOOTSTRAP_RPC_ENABLED: bool(true),
   REMOTE_MCP_ENABLED: bool(true),
+  REMOTE_MCP_SESSION_TTL_SECONDS: int(0),
+  REMOTE_MCP_BIND_IP: bool(true),
+  REMOTE_MCP_SESSIONS_PER_MINUTE: int(10),
+  REMOTE_MCP_MAX_SESSIONS: int(5000),
+  SERVICE_NAME: z.string().min(1).max(64).default("Helius Odometer"),
   BAZAAR_DISCOVERY: bool(false),
 });
 
@@ -289,6 +302,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     adminToken: e.ADMIN_TOKEN,
     bootstrapEnabled: e.BOOTSTRAP_RPC_ENABLED,
     remoteMcpEnabled: e.REMOTE_MCP_ENABLED,
+    remoteMcpSessionTtlSeconds: e.REMOTE_MCP_SESSION_TTL_SECONDS > 0 ? e.REMOTE_MCP_SESSION_TTL_SECONDS : e.SESSION_TTL_SECONDS,
+    remoteMcpBindIp: e.REMOTE_MCP_BIND_IP,
+    remoteMcpSessionsPerMinute: e.REMOTE_MCP_SESSIONS_PER_MINUTE,
+    remoteMcpMaxSessions: e.REMOTE_MCP_MAX_SESSIONS,
+    serviceName: e.SERVICE_NAME,
     bazaarEnabled: e.BAZAAR_DISCOVERY,
   };
 }

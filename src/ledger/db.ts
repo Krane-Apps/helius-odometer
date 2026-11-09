@@ -103,6 +103,21 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS events_kind ON events(kind, created_at);
   `,
+  // v2 (2026-11-09 review): durable request receipts, operator resolution of
+  // top-ups keyed to the original receipt, and a single-writer lock.
+  `
+  ALTER TABLE idempotency ADD COLUMN request_id TEXT;
+  ALTER TABLE idempotency ADD COLUMN charged INTEGER;
+  ALTER TABLE topups ADD COLUMN resolution TEXT;
+  ALTER TABLE topups ADD COLUMN resolution_note TEXT;
+  ALTER TABLE topups ADD COLUMN resolved_at INTEGER;
+  CREATE INDEX IF NOT EXISTS reservations_request ON reservations(request_id);
+  CREATE TABLE IF NOT EXISTS instance_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner TEXT NOT NULL,
+    heartbeat_at INTEGER NOT NULL
+  );
+  `,
 ];
 
 export function openDb(path: string): Db {

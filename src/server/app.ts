@@ -172,6 +172,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
     rebroadcaster,
     bootstrapCache: new LruCache<string, unknown>(1000),
     counters,
+    walletRevocationHooks: [],
     startedAt: Date.now(),
     clientIp,
   };
@@ -216,7 +217,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
   registerBootstrapRoutes(app, deps);
   registerHeliusRestRoutes(app, deps);
   registerAdminRoutes(app, deps);
-  const closeRemoteMcp = config.remoteMcpEnabled ? registerRemoteMcp(app, deps) : async () => {};
+  const remoteMcp = config.remoteMcpEnabled ? registerRemoteMcp(app, deps) : undefined;
   app.notFound((c) => jsonResponse(c, 404, { error: "not_found", docs: "/llms.txt" }));
   app.onError((err, c) => {
     logger.error("unhandled error", { path: c.req.path, error: err });
@@ -253,7 +254,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
       for (const t of timers) clearInterval(t);
       pool.stop();
       rebroadcaster.stop();
-      await closeRemoteMcp();
+      await remoteMcp?.close();
       ledger.close();
     },
   };

@@ -215,6 +215,8 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
     const auth = await resolveWallet(c, deps);
     if (!auth.ok) return jsonResponse(c, auth.status, auth.body);
     const epoch = deps.ledger.bumpSessionEpoch(auth.wallet);
+    // Session tokens fail on their next use; live remote MCP sessions are terminated now.
+    for (const hook of deps.walletRevocationHooks) await hook(auth.wallet);
     return c.json({ wallet: auth.wallet, revoked: true, sessionEpoch: epoch });
   });
 }

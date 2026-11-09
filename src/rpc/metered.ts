@@ -150,12 +150,23 @@ export async function metered(c: Context, deps: AppDeps, args: MeteredArgs): Pro
   try {
     outcome = await args.run(wallet);
   } catch (err) {
-    ledger.release(reservation.reservationId);
-    abortIdem();
+    ledger.release(reservation.reservationId, idemKey ? { wallet, key: idemKey, requestId: args.requestId } : undefined);
     deps.logger.error("request failed", { requestId: args.requestId, error: err });
     return jsonResponse(c, 500, { error: "internal_error", requestId: args.requestId }, extra);
   }
-  const fin = ledger.finalize(reservation.reservationId, outcome.charged, outcome.calls);
+  // The debit and the replay receipt commit together: a crash can no longer leave a
+  // charged request whose stored response is missing.
+  const storedHeaders = { ...outcome.headers, "x-odometer-request-id": args.requestId, "x-odometer-tier": args.tier };
+  const fin = ledger.finalize(
+    reservation.reservationId,
+    outcome.charged,
+    outcome.calls,
+    idemKey
+      ? outcome.status >= 500 && outcome.charged === 0
+        ? { wallet, key: idemKey, requestId: args.requestId, abort: true }
+        : { wallet, key: idemKey, requestId: args.requestId, status: outcome.status, headers: storedHeaders, body: outcome.body }
+      : undefined,
+  );
   deps.counters.revenueMicros += fin.charged;
   const headers: Record<string, string> = {
     ...outcome.headers,
@@ -165,11 +176,5 @@ export async function metered(c: Context, deps: AppDeps, args: MeteredArgs): Pro
     "x-odometer-balance": String(fin.available),
     "x-odometer-balance-usd": microsToUsd(fin.available),
   };
-  if (idemKey) {
-    if (outcome.status < 500) {
-      const stored = { ...outcome.headers, "x-odometer-request-id": args.requestId, "x-odometer-tier": args.tier };
-      ledger.idempotencyComplete(wallet, idemKey, outcome.status, stored, outcome.body);
-    } else abortIdem();
-  }
   return rawJsonResponse(outcome.status, outcome.body, headers);
 }
