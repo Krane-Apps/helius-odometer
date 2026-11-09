@@ -30,7 +30,7 @@ import { OdometerClient, toSiwxSigner } from "../../src/client/index.js";
 import { createFacilitatorApp } from "../../src/facilitator/server.js";
 import { silentLogger } from "../../src/util/log.js";
 import { startApp, type StartedApp } from "../helpers/app-fixture.js";
-import { startHeliusProxy, type HeliusProxy } from "./helius-proxy.js";
+import { startHeliusProxy, type HeliusProxy } from "../../dev/helius-proxy.js";
 import {
   airdrop,
   createAta,
@@ -42,7 +42,7 @@ import {
   validatorAvailable,
   type Rpc,
   type Validator,
-} from "./localnet.js";
+} from "../../dev/localnet.js";
 
 const USDC = 1_000_000n;
 const run = validatorAvailable() ? describe : describe.skip;
@@ -188,7 +188,7 @@ run("x402 end-to-end on a local validator", () => {
     void authority;
     await client.rpc("getSlot");
     const { getTransferCheckedInstruction } = await import("@solana-program/token");
-    const { sendInstructions, ata } = await import("./localnet.js");
+    const { sendInstructions, ata } = await import("../../dev/localnet.js");
     await createAta(rpc, agent, agent2.address, mint);
     await sendInstructions(rpc, agent, [
       getTransferCheckedInstruction({
@@ -226,7 +226,7 @@ run("x402 end-to-end on a local validator", () => {
   it("refuses to credit a replayed payment twice", async () => {
     const payer = await generateKeyPairSigner();
     const { getTransferCheckedInstruction } = await import("@solana-program/token");
-    const { sendInstructions, ata } = await import("./localnet.js");
+    const { sendInstructions, ata } = await import("../../dev/localnet.js");
     await createAta(rpc, agent, payer.address, mint);
     await sendInstructions(rpc, agent, [
       getTransferCheckedInstruction({
@@ -261,7 +261,7 @@ run("x402 end-to-end on a local validator", () => {
     const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
     const { createKeyPairSignerFromPrivateKeyBytes, getBase58Encoder } = await import("@solana/kit");
     const { getTransferCheckedInstruction } = await import("@solana-program/token");
-    const { sendInstructions, ata } = await import("./localnet.js");
+    const { sendInstructions, ata } = await import("../../dev/localnet.js");
 
     // An exportable wallet, as an agent operator would store it for the MCP server.
     const seed = crypto.getRandomValues(new Uint8Array(32));
