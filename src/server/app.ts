@@ -9,7 +9,7 @@ import { BlockhashCache } from "../payments/blockhash.js";
 import { Paywall } from "../payments/paywall.js";
 import { SessionManager } from "../payments/session.js";
 import { SiwxAuth } from "../payments/siwx.js";
-import { Payments } from "../payments/x402.js";
+import { Payments, siwxStatement } from "../payments/x402.js";
 import { Pricing, type PricingOptions } from "../pricing/pricing.js";
 import { SlotHighWaterMarks, TxSessions } from "../routing/consistency.js";
 import { LatencyMetrics } from "../routing/metrics.js";
@@ -23,7 +23,10 @@ import { registerPublicRoutes } from "../api/public.js";
 import { registerBootstrapRoutes } from "../rpc/bootstrap.js";
 import { registerRpcRoutes } from "../rpc/handler.js";
 import { REST_ROUTES, registerHeliusRestRoutes, restEnabled } from "../rpc/helius-rest.js";
+import { hostname } from "node:os";
 import { createLogger, type Logger } from "../util/log.js";
+import { randomHex } from "../util/ids.js";
+import { Alerter } from "./alerts.js";
 import { LruCache } from "../util/lru.js";
 import { usdToMicros } from "../util/money.js";
 import { KeyedRateLimiter, TokenBucket } from "../util/token-bucket.js";
@@ -36,6 +39,8 @@ export interface CreateAppOptions {
   /** Replace the HTTP facilitator client (tests, in-process facilitator). */
   facilitator?: FacilitatorClient;
   fetchImpl?: typeof fetch;
+  /** Called if another process takes over the ledger's writer lock; the entrypoint exits. */
+  onWriterLockLost?: () => void;
 }
 
 export interface OdometerApp {
@@ -108,6 +113,14 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
     return v ? { blockhash: v.blockhash, lastValidBlockHeight: v.lastValidBlockHeight } : undefined;
   });
 
+  const alerter = new Alerter({
+    webhookUrl: config.alertWebhookUrl,
+    authHeader: config.alertWebhookAuthHeader,
+    serviceName: config.serviceName,
+    dedupeMs: config.alertDedupeMinutes * 60_000,
+    logger,
+    fetchImpl,
+  });
   const payments = new Payments({
     config,
     ledger,
@@ -115,13 +128,17 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
     enabledTiers,
     facilitator: opts.facilitator,
     blockhashes,
+    onAmbiguousSettlement: (info) =>
+      void alerter.alert(`settlement:${info.payloadHash}`, "critical", "Top-up settlement outcome unknown; frozen for operator review", info),
+    onSettledButUnrecorded: (info) =>
+      void alerter.alert(`unrecorded:${info.txSignature}`, "critical", "Top-up settled on-chain but the ledger could not record it", info),
     restRoutes: restEnabled({ config }) ? REST_ROUTES.map((r) => ({ pattern: r.pattern, description: r.description })) : [],
   });
   const sessions = new SessionManager(config.sessionSecret, config.sessionTtlSeconds, (w) => ledger.getAccount(w)?.sessionEpoch ?? 0);
   const siwx = new SiwxAuth({
     origin: config.publicOrigin,
     network: config.network,
-    statement: "Sign in to Helius Odometer to spend your prepaid RPC balance",
+    statement: siwxStatement(config.serviceName),
     expirationSeconds: 300,
     useNonce: (nonce, expiresAt) => ledger.useNonce(nonce, expiresAt),
   });
@@ -172,6 +189,8 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
     rebroadcaster,
     bootstrapCache: new LruCache<string, unknown>(1000),
     counters,
+    alerter,
+    writerOwner: `${hostname()}:${process.pid}:${randomHex(4)}`,
     walletRevocationHooks: [],
     startedAt: Date.now(),
     clientIp,
@@ -229,9 +248,14 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
     app,
     deps,
     start() {
-      // Anything reserved by a previous process can never finalize: release it.
-      const released = ledger.releaseStaleReservations(0);
-      if (released) logger.warn("released reservations left by a previous process", { released });
+      // One writer per ledger: refuse to start next to another live process.
+      ledger.acquireWriterLock(deps.writerOwner);
+      // Anything reserved by a previous process can never finalize: release it and
+      // mark its idempotency keys aborted so those requests may be retried.
+      const recovered = ledger.recoverAfterRestart();
+      if (recovered.releasedReservations || recovered.abortedReceipts) {
+        logger.warn("recovered requests interrupted by a previous process", recovered);
+      }
       pool.start();
       payments.initializeInBackground((err) =>
         logger.warn("facilitator sync failed; retrying", { error: err instanceof Error ? err.message : String(err) }),
@@ -239,12 +263,28 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
       void blockhashes.refresh();
       timers.push(
         setInterval(() => {
+          if (ledger.heartbeatWriterLock(deps.writerOwner)) return;
+          void alerter.alert("writer-lock", "critical", "Another process took over the ledger writer lock; this process stops writing", {
+            owner: deps.writerOwner,
+          });
+          opts.onWriterLockLost?.();
+        }, 10_000),
+        setInterval(() => {
           const report = ledger.reconcile();
-          if (!report.ok) logger.error("ledger reconciliation mismatch", { report });
+          if (report.ok) return;
+          const summary = {
+            arithmeticOk: report.arithmeticOk,
+            balanceMismatches: report.balanceMismatches.length,
+            reservedMismatches: report.reservedMismatches.length,
+            unresolvedTopups: report.unresolvedTopups,
+          };
+          if (!report.arithmeticOk) void alerter.alert("reconcile-mismatch", "critical", "Ledger arithmetic mismatch: stop traffic and investigate", summary);
+          else void alerter.alert("reconcile-unresolved", "warning", report.warnings.join("; "), summary);
         }, 60_000),
         setInterval(() => {
           ledger.pruneNonces();
-          ledger.pruneIdempotency();
+          ledger.pruneIdempotency(config.idempotencyRetentionHours * 3_600_000);
+          ledger.pruneReservations(config.reservationRetentionDays * 86_400_000);
           ledger.pruneEvents();
         }, 3_600_000),
       );
@@ -255,7 +295,11 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
       pool.stop();
       rebroadcaster.stop();
       await remoteMcp?.close();
-      ledger.close();
+      try {
+        ledger.releaseWriterLock(deps.writerOwner);
+      } finally {
+        ledger.close();
+      }
     },
   };
 }

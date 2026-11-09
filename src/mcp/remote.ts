@@ -208,7 +208,7 @@ function bindingState(deps: AppDeps, state: McpSession, ip: string, index: Bindi
 function buildServer(deps: AppDeps, state: McpSession, index: BindingIndex): McpServer {
   const name = deps.config.serviceName;
   const server = new McpServer(
-    { name: "helius-odometer", title: name, version: "0.1.0" },
+    { name: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "solana-rpc", title: name, version: "0.1.0" },
     {
       instructions:
         `${name}: pay-per-call Solana RPC. Before your first call, ask your user how important speed is ` +

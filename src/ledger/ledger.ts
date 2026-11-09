@@ -90,7 +90,20 @@ export interface ReconcileReport {
   reservedMismatches: Array<{ wallet: string; reserved: Micros; openReservations: Micros }>;
   releasedStaleReservations: number;
   topupsNeedingReview: number;
+  /** Top-ups whose outcome is unknown: possible money owed that the arithmetic cannot see. */
+  unresolvedTopups: { count: number; amountMicros: Micros };
+  /** Refunds requested but not yet paid out: owed to agents. */
+  pendingRefunds: { count: number; amountMicros: Micros };
+  /** What the operator owes agents: balances plus pending refunds (excludes unresolved top-ups). */
+  liabilitiesMicros: Micros;
+  /** Balances equal their journal and reserved amounts equal open reservations. */
+  arithmeticOk: boolean;
+  /**
+   * Arithmetic holds and nothing is unresolved. This is a local consistency
+   * check: it does not read the chain or prove custody (see GET /admin/readiness).
+   */
   ok: boolean;
+  warnings: string[];
 }
 
 export interface LedgerOptions {
@@ -307,6 +320,16 @@ export class Ledger {
 
   getTopup(id: string): TopupRow | undefined {
     return this.q("SELECT * FROM topups WHERE id = ?").get(id) as TopupRow | undefined;
+  }
+
+  /**
+   * Top-ups that could still credit this wallet: settling (the payer is not
+   * known until settlement answers, so any wallet's), or awaiting review.
+   */
+  openTopupsFor(wallet: string): TopupRow[] {
+    return this.q(
+      "SELECT * FROM topups WHERE status IN ('settling', 'needs_review') AND (wallet = ? OR wallet IS NULL) ORDER BY created_at",
+    ).all(wallet) as unknown as TopupRow[];
   }
 
   /** Top-ups whose outcome is unknown: settling past the stale window, or under review. */
@@ -592,9 +615,12 @@ export class Ledger {
    * are marked aborted so the same request can be retried.
    */
   recoverAfterRestart(): { releasedReservations: number; abortedReceipts: number } {
-    const released = this.releaseStaleReservations(0);
+    // Every open reservation, whatever its timestamp: one made in the same
+    // millisecond, or "in the future" after the clock stepped back, is just as dead.
+    const open = this.q("SELECT id FROM reservations WHERE status = 'reserved'").all() as Array<{ id: string }>;
+    for (const { id } of open) this.release(id);
     const aborted = Number(this.q("UPDATE idempotency SET status = 'aborted' WHERE status = 'in_flight'").run().changes);
-    return { releasedReservations: released, abortedReceipts: aborted };
+    return { releasedReservations: open.length, abortedReceipts: aborted };
   }
 
   /** Drops resolved reservations older than the cutoff; debits stay in the journal. */
@@ -721,10 +747,24 @@ export class Ledger {
 
   // ------------------------------------------------------------------- admin
 
-  /** Manual, journaled balance correction by the operator. */
-  adjust(wallet: string, amount: Micros, note: string): Account {
+  /**
+   * Manual, journaled balance correction by the operator. A credit is refused
+   * while a top-up that could credit this wallet is unresolved: recovering a
+   * payment this way would let its receipt be credited again later. Use
+   * resolveTopup for that; acknowledge only credits unrelated to a top-up.
+   */
+  adjust(wallet: string, amount: Micros, note: string, opts: { acknowledgeUnresolvedTopups?: boolean } = {}): Account {
     if (!Number.isInteger(amount) || amount === 0) throw new LedgerError("invalid_amount", "amount must be a non-zero integer");
     return transaction(this.db, () => {
+      if (amount > 0 && !opts.acknowledgeUnresolvedTopups) {
+        const open = this.openTopupsFor(wallet);
+        if (open.length) {
+          throw new LedgerError(
+            "unresolved_topups",
+            `${open.length} top-up(s) that could credit this wallet are unresolved (${open.map((t) => t.id).join(", ")}); resolve them with resolveTopup, which credits the original receipt once`,
+          );
+        }
+      }
       this.ensureAccount(wallet);
       const account = this.getAccount(wallet)!;
       if (account.available + amount < 0) throw new LedgerError("insufficient_balance", "adjustment would go negative");
@@ -771,13 +811,31 @@ export class Ledger {
       .all() as Array<{ wallet: string; reserved: number; openReservations: number }>;
     const checked = (this.q("SELECT COUNT(*) AS n FROM accounts").get() as { n: number }).n;
     const review = (this.q("SELECT COUNT(*) AS n FROM topups WHERE status = 'needs_review'").get() as { n: number }).n;
+    const unresolved = this.q(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS amount FROM topups WHERE status = 'needs_review' OR (status = 'settling' AND created_at < ?)",
+    ).get(topupCutoff) as { n: number; amount: number };
+    const refunds = this.q("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS amount FROM refunds WHERE status = 'requested'").get() as {
+      n: number;
+      amount: number;
+    };
+    const balances = (this.q("SELECT COALESCE(SUM(balance), 0) AS b FROM accounts").get() as { b: number }).b;
+    const arithmeticOk = balanceMismatches.length === 0 && reservedMismatches.length === 0;
+    const warnings: string[] = [];
+    if (!arithmeticOk) warnings.push("ledger arithmetic mismatch: stop traffic and investigate");
+    if (unresolved.n > 0) warnings.push(`${unresolved.n} top-up(s) with unknown outcome need operator review`);
+    if (refunds.n > 0) warnings.push(`${refunds.n} refund(s) awaiting payout`);
     return {
       checkedAccounts: checked,
       balanceMismatches,
       reservedMismatches,
       releasedStaleReservations: released,
       topupsNeedingReview: review,
-      ok: balanceMismatches.length === 0 && reservedMismatches.length === 0,
+      unresolvedTopups: { count: unresolved.n, amountMicros: unresolved.amount },
+      pendingRefunds: { count: refunds.n, amountMicros: refunds.amount },
+      liabilitiesMicros: balances + refunds.amount,
+      arithmeticOk,
+      ok: arithmeticOk && unresolved.n === 0,
+      warnings,
     };
   }
 

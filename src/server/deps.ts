@@ -1,4 +1,5 @@
 import type { Context } from "hono";
+import type { Alerter } from "./alerts.js";
 import type { Config } from "../config.js";
 import type { Ledger } from "../ledger/ledger.js";
 import type { BlockhashCache } from "../payments/blockhash.js";
@@ -50,6 +51,9 @@ export interface AppDeps {
   rebroadcaster: Rebroadcaster;
   bootstrapCache: LruCache<string, unknown>;
   counters: Counters;
+  alerter: Alerter;
+  /** Identity of this process in the ledger's single-writer lock. */
+  writerOwner: string;
   /** Run when a wallet revokes its sessions (e.g. to terminate its remote MCP sessions). */
   walletRevocationHooks: Array<(wallet: string) => Promise<void> | void>;
   startedAt: number;

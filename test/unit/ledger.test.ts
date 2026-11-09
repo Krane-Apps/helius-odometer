@@ -155,7 +155,9 @@ describe("Ledger", () => {
     const report = ledger.reconcile();
     expect(report.releasedStaleReservations).toBe(1);
     expect(report.topupsNeedingReview).toBe(1);
-    expect(report.ok).toBe(true);
+    expect(report.arithmeticOk).toBe(true);
+    expect(report.ok).toBe(false);
+    expect(report.unresolvedTopups).toEqual({ count: 1, amountMicros: 1 });
     ledger.db.prepare("UPDATE accounts SET balance = balance + 1 WHERE wallet = ?").run(W);
     const bad = ledger.reconcile();
     expect(bad.ok).toBe(false);

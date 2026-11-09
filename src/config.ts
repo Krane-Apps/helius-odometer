@@ -76,6 +76,11 @@ export interface Config {
   maxPublicAttempts: number;
 
   adminToken?: string;
+  alertWebhookUrl?: string;
+  alertWebhookAuthHeader?: string;
+  alertDedupeMinutes: number;
+  idempotencyRetentionHours: number;
+  reservationRetentionDays: number;
   bootstrapEnabled: boolean;
   remoteMcpEnabled: boolean;
   /** Absolute lifetime of a remote MCP session's spending binding. */
@@ -174,6 +179,11 @@ const EnvSchema = z.object({
   MAX_PUBLIC_ATTEMPTS: int(2),
 
   ADMIN_TOKEN: z.string().min(16).optional(),
+  ALERT_WEBHOOK_URL: z.string().url().optional(),
+  ALERT_WEBHOOK_AUTH_HEADER: z.string().optional(),
+  ALERT_DEDUPE_MINUTES: int(15),
+  IDEMPOTENCY_RETENTION_HOURS: int(24),
+  RESERVATION_RETENTION_DAYS: int(30),
   BOOTSTRAP_RPC_ENABLED: bool(true),
   REMOTE_MCP_ENABLED: bool(true),
   REMOTE_MCP_SESSION_TTL_SECONDS: int(0),
@@ -300,6 +310,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     publicAttemptTimeoutMs: e.PUBLIC_ATTEMPT_TIMEOUT_MS,
     maxPublicAttempts: e.MAX_PUBLIC_ATTEMPTS,
     adminToken: e.ADMIN_TOKEN,
+    alertWebhookUrl: e.ALERT_WEBHOOK_URL,
+    alertWebhookAuthHeader: e.ALERT_WEBHOOK_AUTH_HEADER,
+    alertDedupeMinutes: e.ALERT_DEDUPE_MINUTES,
+    idempotencyRetentionHours: e.IDEMPOTENCY_RETENTION_HOURS,
+    reservationRetentionDays: e.RESERVATION_RETENTION_DAYS,
     bootstrapEnabled: e.BOOTSTRAP_RPC_ENABLED,
     remoteMcpEnabled: e.REMOTE_MCP_ENABLED,
     remoteMcpSessionTtlSeconds: e.REMOTE_MCP_SESSION_TTL_SECONDS > 0 ? e.REMOTE_MCP_SESSION_TTL_SECONDS : e.SESSION_TTL_SECONDS,

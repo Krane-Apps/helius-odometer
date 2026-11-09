@@ -17,7 +17,7 @@ async function main(): Promise<void> {
   }
   if (tiers.length === 0) throw new Error("No tier can be served: configure HELIUS_API_KEY and/or PUBLIC_UPSTREAMS");
 
-  const odometer = createApp({ config, logger });
+  const odometer = createApp({ config, logger, onWriterLockLost: () => process.exit(1) });
   odometer.start();
   const server = serve({ fetch: odometer.app.fetch, port: config.port, hostname: config.host }, (info) => {
     logger.info("helius-odometer listening", {

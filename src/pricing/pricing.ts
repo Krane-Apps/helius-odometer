@@ -71,7 +71,7 @@ export interface PricingOptions {
 }
 
 export const RPC_ERRORS = {
-  methodNotFound: { code: -32601, message: "Method not found or not supported by Helius Odometer", httpStatus: 400 },
+  methodNotFound: { code: -32601, message: "Method not found or not supported by this gateway", httpStatus: 400 },
   blocked: { code: -32050, message: "Method blocked by gateway policy", httpStatus: 403 },
   subscription: {
     code: -32051,

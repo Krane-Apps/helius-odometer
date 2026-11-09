@@ -85,6 +85,8 @@ export interface PaymentsOptions {
   restRoutes?: Array<{ pattern: string; description: string }>;
   /** Called when a settlement outcome is unknown and the top-up is frozen for review. */
   onAmbiguousSettlement?: (info: { payloadHash: string; reason: string; txSignature?: string }) => void;
+  /** Called when funds settled on-chain but the ledger could not record the credit. */
+  onSettledButUnrecorded?: (info: { wallet: string; txSignature: string; amount: number; error: string }) => void;
 }
 
 export const TIER_DESCRIPTIONS: Record<Tier, string> = {
@@ -120,10 +122,20 @@ export function paymentPayloadHash(payload: Pick<PaymentPayload, "payload"> | { 
 
 const NO_GRANT_STORAGE = { hasPaid: () => false, recordPayment: () => {} };
 
-const BROWSER_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Helius Odometer</title></head>
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+
+function browserHtml(serviceName: string): string {
+  const name = escapeHtml(serviceName);
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${name}</title></head>
 <body style="font-family:system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem;line-height:1.5">
-<h1>Helius Odometer</h1><p>This endpoint is pay-per-call Solana RPC for AI agents over x402.
+<h1>${name}</h1><p>This endpoint is pay-per-call Solana RPC for AI agents over x402.
 Send JSON-RPC with an x402-capable client; see <a href="/llms.txt">/llms.txt</a> and <a href="/pricing">/pricing</a>.</p></body></html>`;
+}
+
+/** The SIWx sign-in statement; the verifier must expect exactly this text. */
+export function siwxStatement(serviceName: string): string {
+  return `Sign in to ${serviceName} to spend your prepaid RPC balance`;
+}
 
 /**
  * x402 integration: the resource server, the facilitator client, the paid
@@ -212,6 +224,7 @@ export class Payments {
         }
       } catch (err) {
         logger.error("top-up settled but not recorded", { wallet: payer, txSignature, amount, error: err });
+        opts.onSettledButUnrecorded?.({ wallet: payer, txSignature, amount, error: err instanceof Error ? err.message : String(err) });
         try {
           ledger.markTopupNeedsReview(payloadHash, `ledger error: ${err instanceof Error ? err.message : String(err)}`, {
             wallet: payer,
@@ -264,14 +277,14 @@ export class Payments {
       resource: `${config.publicOrigin}${resourcePath}`,
       description,
       mimeType: "application/json",
-      serviceName: "Helius Odometer",
-      tags: ["solana", "rpc", "helius", "prepaid"],
-      customPaywallHtml: BROWSER_HTML,
+      serviceName: config.serviceName,
+      tags: ["solana", "rpc", "prepaid"],
+      customPaywallHtml: browserHtml(config.serviceName),
       unpaidResponseBody: (ctx) => this.unpaidBody(ctx),
       settlementFailedResponseBody: (_ctx, failure) => settlementFailureBody(failure.errorReason, failure.transaction),
       extensions: {
         ...declareSIWxExtension({
-          statement: "Sign in to Helius Odometer to spend your prepaid RPC balance",
+          statement: siwxStatement(config.serviceName),
           expirationSeconds: 300,
         }),
         ...(config.bazaarEnabled ? bazaar : {}),
@@ -299,13 +312,13 @@ export class Payments {
     for (const tier of this.opts.enabledTiers) {
       routes[`POST /v1/rpc/${tier}`] = this.routeConfig(
         `/v1/rpc/${tier}`,
-        `Prepaid balance top-up for Helius Odometer pay-per-call Solana RPC. ${TIER_DESCRIPTIONS[tier]} Each call is debited from your balance; see /pricing.`,
+        `Prepaid balance top-up for ${this.opts.config.serviceName} pay-per-call Solana RPC. ${TIER_DESCRIPTIONS[tier]} Each call is debited from your balance; see /pricing.`,
         rpcBazaar,
       );
     }
     routes["POST /v1/topup"] = this.routeConfig(
       "/v1/topup",
-      "Prepaid balance top-up for Helius Odometer. Returns your balance and a session token.",
+      `Prepaid balance top-up for ${this.opts.config.serviceName}. Returns your balance and a session token.`,
       declareDiscoveryExtension({ bodyType: "json", input: {}, output: { example: { wallet: "<address>", balanceUsd: "1" } } }),
     );
     for (const r of this.opts.restRoutes ?? []) {

@@ -4,7 +4,8 @@ import { LedgerError } from "../ledger/ledger.js";
 import type { AppDeps } from "../server/deps.js";
 import { jsonResponse } from "../server/http.js";
 import { microsToAtomic, microsToUsd, usdToMicros } from "../util/money.js";
-import { verifyTopupTransfer } from "../payments/verify.js";
+import { readTokenHoldings, verifyTopupTransfer } from "../payments/verify.js";
+import { SOLANA_MAINNET, USDC_MINTS } from "../config.js";
 import { accountView } from "./public.js";
 
 /** Operator endpoints. Disabled unless ADMIN_TOKEN is set. */
@@ -55,7 +56,7 @@ export function registerAdminRoutes(app: Hono, deps: AppDeps): void {
     const wallet = c.req.param("wallet");
     // A manual credit is not linked to any top-up receipt; using one to recover a payment would let
     // the original receipt be credited again later. Point the operator at the resolve endpoint.
-    const unresolved = deps.ledger.unresolvedTopups().filter((t) => t.wallet === wallet || t.wallet === null);
+    const unresolved = deps.ledger.openTopupsFor(wallet);
     if (unresolved.length > 0 && body.amountUsd > 0 && !body.acknowledgeUnresolvedTopups) {
       return jsonResponse(c, 409, {
         error: "unresolved_topups",
@@ -66,7 +67,9 @@ export function registerAdminRoutes(app: Hono, deps: AppDeps): void {
     }
     const sign = body.amountUsd < 0 ? -1 : 1;
     try {
-      const account = deps.ledger.adjust(wallet, sign * usdToMicros(Math.abs(body.amountUsd)), body.note);
+      const account = deps.ledger.adjust(wallet, sign * usdToMicros(Math.abs(body.amountUsd)), body.note, {
+        acknowledgeUnresolvedTopups: body.acknowledgeUnresolvedTopups === true,
+      });
       deps.logger.info("admin adjustment", { wallet: account.wallet, amountUsd: body.amountUsd, note: body.note });
       return c.json(accountView(deps, account.wallet));
     } catch (err) {
@@ -167,4 +170,60 @@ export function registerAdminRoutes(app: Hono, deps: AppDeps): void {
   });
 
   app.post("/admin/reconcile", (c) => c.json(deps.ledger.reconcile()));
+
+  /**
+   * Pre-deposit readiness: the launch checks from the 2026-11-09 review that the
+   * gateway can verify itself. "fail" means do not take deposits.
+   */
+  app.get("/admin/readiness", async (c) => {
+    type Check = { name: string; status: "pass" | "warn" | "fail"; detail: string };
+    const checks: Check[] = [];
+    const add = (name: string, status: Check["status"], detail: string) => checks.push({ name, status, detail });
+    const { config, ledger } = deps;
+
+    add(
+      "facilitator",
+      deps.payments.initialized ? "pass" : "fail",
+      deps.payments.initialized ? "facilitator capabilities loaded" : `facilitator not synced: ${deps.payments.lastInitError ?? "pending"}`,
+    );
+    if (config.network !== SOLANA_MAINNET) add("network", "warn", `${config.network} is not Solana mainnet: a test deployment`);
+    else if (config.paymentAsset !== USDC_MINTS[SOLANA_MAINNET]) add("network", "warn", "mainnet with a non-USDC payment asset");
+    else add("network", "pass", "Solana mainnet, USDC");
+    add("storage", config.databasePath === ":memory:" ? "fail" : "pass", config.databasePath === ":memory:" ? "in-memory ledger loses balances on restart" : config.databasePath);
+    add("session_secret", config.sessionSecretGenerated ? "fail" : "pass", config.sessionSecretGenerated ? "SESSION_SECRET not set; sessions die on restart" : "set");
+    add("alerts", deps.alerter.configured ? "pass" : "warn", deps.alerter.configured ? "ALERT_WEBHOOK_URL set" : "alerts only reach logs; set ALERT_WEBHOOK_URL");
+    const lock = ledger.db.prepare("SELECT owner FROM instance_lock WHERE id = 1").get() as { owner: string } | undefined;
+    add("writer_lock", lock?.owner === deps.writerOwner ? "pass" : "fail", lock ? `held by ${lock.owner}` : "not held: start() was not called");
+
+    const report = ledger.reconcile();
+    add("ledger_arithmetic", report.arithmeticOk ? "pass" : "fail", report.arithmeticOk ? "balances match their journal" : "mismatch: see POST /admin/reconcile");
+    add(
+      "unresolved_topups",
+      report.unresolvedTopups.count === 0 ? "pass" : "fail",
+      report.unresolvedTopups.count === 0
+        ? "none"
+        : `${report.unresolvedTopups.count} top-up(s), ${microsToUsd(report.unresolvedTopups.amountMicros)} USD, need review`,
+    );
+
+    const holdings = await readTokenHoldings(deps.pool, { owner: config.payTo, mint: config.paymentAsset });
+    if (!holdings.ok) {
+      add("custody", "fail", `could not verify custody (${holdings.error}); retry, or check the upstreams`);
+    } else if (holdings.accounts === 0) {
+      add("custody", "fail", "PAYTO_ADDRESS has no token account for the payment asset; top-ups would fail");
+    } else if (holdings.associatedAccount === "missing") {
+      add("custody", "fail", "PAYTO_ADDRESS has no associated token account for the payment asset; x402 payments go to it, so top-ups would fail");
+    } else {
+      const liabilitiesAtomic = microsToAtomic(report.liabilitiesMicros, config.paymentAssetDecimals);
+      add(
+        "custody",
+        holdings.amountAtomic >= liabilitiesAtomic ? "pass" : "fail",
+        `operator holds ${holdings.amountAtomic} atomic units (confirmed); owes agents ${liabilitiesAtomic} (balances plus pending refunds)`,
+      );
+    }
+    if (config.bazaarEnabled) add("public_listing", "warn", "Bazaar discovery is on: facilitators may list this service publicly");
+    if (config.sendTransactionEnabled) add("send_transaction", "warn", "sendTransaction is enabled: confirm Helius permits fronting its staked path");
+    if (/helius/i.test(config.serviceName)) add("branding", "warn", "the public name includes Helius; set SERVICE_NAME to a neutral name until branding is approved");
+
+    return c.json({ ready: !checks.some((k) => k.status === "fail"), checks, reconcile: report });
+  });
 }

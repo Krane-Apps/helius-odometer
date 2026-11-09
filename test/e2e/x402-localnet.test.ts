@@ -393,5 +393,13 @@ run("x402 end-to-end on a local validator", () => {
     expect(gw.odometer.deps.ledger.reconcile().ok).toBe(true);
     const bal = await client.balance();
     expect(bal.wallet).toBe(agent.address);
+
+    // Readiness reads custody from the chain: the operator's ATA holds at least what agents are owed.
+    const readiness = (await (await fetch(`${gw.url}/admin/readiness`, { headers: { authorization: "Bearer admin-token-0123456789" } })).json()) as {
+      checks: Array<{ name: string; status: string; detail: string }>;
+    };
+    const custody = readiness.checks.find((k) => k.name === "custody")!;
+    expect(custody.status, custody.detail).toBe("pass");
+    expect(custody.detail).toContain(`operator holds ${received} atomic units (confirmed)`);
   });
 });

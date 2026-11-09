@@ -18,7 +18,7 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
 
   app.get("/", (c) =>
     c.json({
-      name: "Helius Odometer",
+      name: config.serviceName,
       description: "Pay-per-call Solana RPC for AI agents over x402. Wallet in, answers out: no signup, no email, no API key.",
       disclaimer: "Independent project; not affiliated with or endorsed by Helius.",
       network: config.network,
@@ -75,7 +75,7 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
   app.get("/.well-known/x402", (c) =>
     c.json({
       x402Version: 2,
-      service: "Helius Odometer",
+      service: config.serviceName,
       network: config.network,
       payTo: config.payTo,
       asset: config.paymentAsset,
@@ -220,6 +220,26 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
     for (const hook of deps.walletRevocationHooks) await hook(auth.wallet);
     return c.json({ wallet: auth.wallet, revoked: true, sessionEpoch: epoch });
   });
+
+  /**
+   * Was this request charged? For a client whose response was lost: look it up by
+   * the X-Odometer-Request-Id it saw, or by its Idempotency-Key (then replay the
+   * same request with that key to get the stored response).
+   */
+  app.get("/v1/receipts", async (c) => {
+    const auth = await resolveWallet(c, deps);
+    if (!auth.ok) return jsonResponse(c, auth.status, auth.body);
+    const requestId = c.req.query("requestId");
+    const idempotencyKey = c.req.query("idempotencyKey");
+    if (!requestId && !idempotencyKey) return jsonResponse(c, 400, { error: "requestId or idempotencyKey is required" });
+    const receipt = deps.ledger.getReceipt(auth.wallet, idempotencyKey ? { idempotencyKey } : { requestId: requestId! });
+    const retention = {
+      idempotencyKeysHours: config.idempotencyRetentionHours,
+      requestRecordsDays: config.reservationRetentionDays,
+    };
+    if (!receipt) return jsonResponse(c, 404, { error: "not_found", message: "No such request for this wallet, or it is past retention", retention });
+    return c.json({ receipt: { ...receipt, chargedUsd: microsToUsd(receipt.chargedMicros) }, retention });
+  });
 }
 
 export function accountView(deps: AppDeps, wallet: string): Record<string, unknown> {
@@ -282,7 +302,7 @@ export function pricingDocument(deps: AppDeps): Record<string, unknown> {
 function llmsTxt(deps: AppDeps): string {
   const { config } = deps;
   const tiers = [...deps.enabledTiers].map((t) => `- ${t}: POST ${config.publicOrigin}/v1/rpc/${t}  ${TIER_DESCRIPTIONS[t]}`).join("\n");
-  return `# Helius Odometer
+  return `# ${config.serviceName}
 
 > Pay-per-call Solana RPC for AI agents over x402. Wallet in, answers out: no signup, no email, no API key.
 > Independent project; not affiliated with or endorsed by Helius.

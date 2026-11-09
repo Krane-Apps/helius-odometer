@@ -4,6 +4,8 @@ import { OdometerClient, OdometerError, type Tier } from "../client/index.js";
 import { BILLING_SUMMARY } from "../pricing/billing.js";
 
 export interface GatewayIndex {
+  /** The gateway's public name (its SERVICE_NAME). */
+  name?: string;
   network: string;
   topupOptionsUsd: number[];
   tiers: Array<{ tier: Tier; endpoint: string; description: string }>;
@@ -30,11 +32,12 @@ function describeError(err: unknown) {
  * One tool per tier so the agent makes an explicit, user-informed speed choice.
  */
 export function createOdometerMcpServer(client: OdometerClient, index: GatewayIndex, fetchImpl: typeof fetch = fetch): McpServer {
+  const name = index.name ?? "Helius Odometer";
   const server = new McpServer(
     { name: "helius-odometer", version: "0.1.0" },
     {
       instructions:
-        `Helius Odometer: pay-per-call Solana RPC paid from this wallet's prepaid USDC balance (${client.wallet}). ` +
+        `${name}: pay-per-call Solana RPC paid from this wallet's prepaid USDC balance (${client.wallet}). ` +
         `${SPEED_GUIDANCE} Top-ups happen automatically within the configured spend limits. ` +
         "Use odometer_pricing to check what a method costs and odometer_balance to see what is left.",
     },
@@ -86,7 +89,7 @@ export function createOdometerMcpServer(client: OdometerClient, index: GatewayIn
   server.registerTool(
     "odometer_balance",
     {
-      title: "Helius Odometer balance",
+      title: `${name} balance`,
       description: "Prepaid balance, daily cap and totals for this wallet.",
       inputSchema: {},
       annotations: { readOnlyHint: true },
@@ -103,7 +106,7 @@ export function createOdometerMcpServer(client: OdometerClient, index: GatewayIn
   server.registerTool(
     "odometer_pricing",
     {
-      title: "Helius Odometer pricing",
+      title: `${name} pricing`,
       description: "Price per call for each tier. Pass a method name to see just that method.",
       inputSchema: { method: z.string().optional().describe("Optional method name to filter, e.g. getAsset") },
       annotations: { readOnlyHint: true },
@@ -126,7 +129,7 @@ export function createOdometerMcpServer(client: OdometerClient, index: GatewayIn
   server.registerTool(
     "odometer_topup",
     {
-      title: "Top up Helius Odometer balance",
+      title: `Top up ${name} balance`,
       description: `Pay a USDC top-up now. Options: ${index.topupOptionsUsd.map((u) => `$${u}`).join(", ")}. Respects the configured spend limits.`,
       inputSchema: { usd: z.number().positive().describe("Top-up amount in USD; must be one of the offered options") },
     },
