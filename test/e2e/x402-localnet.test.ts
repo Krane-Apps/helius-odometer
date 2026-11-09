@@ -324,6 +324,55 @@ run("x402 end-to-end on a local validator", () => {
     }
   });
 
+  it("serves a stock x402 MCP client over remote MCP: one top-up, then many calls", async () => {
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+    const { wrapMCPClientWithPayment } = await import("@x402/mcp");
+    const { getTransferCheckedInstruction } = await import("@solana-program/token");
+    const { sendInstructions, ata } = await import("../../dev/localnet.js");
+
+    const remoteAgent = await generateKeyPairSigner();
+    await createAta(rpc, agent, remoteAgent.address, mint);
+    await sendInstructions(rpc, agent, [
+      getTransferCheckedInstruction({
+        source: await ata(agent.address, mint),
+        mint,
+        destination: await ata(remoteAgent.address, mint),
+        authority: agent,
+        amount: 2n * USDC,
+        decimals: 6,
+      }),
+    ]);
+    const payer = new x402Client()
+      .register("solana:*", new ExactSvmScheme(remoteAgent, { rpcUrl: validator.rpcUrl, transactionVersions: [0] }))
+      .setSpendControls({ allowedAssets: [{ network: SOLANA_DEVNET, asset: mint }] });
+    const mcp = wrapMCPClientWithPayment(new Client({ name: "remote-agent", version: "1.0.0" }), payer, { autoPayment: true });
+    await mcp.connect(new StreamableHTTPClientTransport(new URL(`${gw.url}/mcp`)));
+    try {
+      const before = await tokenBalance(rpc, remoteAgent.address, mint);
+      const first = await mcp.callTool("solana_rpc_economy", { method: "getSlot" });
+      expect(first.isError).toBeFalsy();
+      expect(first.paymentMade).toBe(true);
+      expect(first.paymentResponse?.payer).toBe(remoteAgent.address);
+      expect(typeof JSON.parse((first.content[0] as unknown as { text: string }).text).result).toBe("number");
+      expect(await tokenBalance(rpc, remoteAgent.address, mint)).toBe(before - USDC);
+
+      for (let i = 0; i < 3; i++) {
+        const next = await mcp.callTool("solana_rpc_fast", { method: "getBalance", params: [remoteAgent.address] });
+        expect(next.isError).toBeFalsy();
+        expect(next.paymentMade).toBe(false);
+      }
+      expect(await tokenBalance(rpc, remoteAgent.address, mint)).toBe(before - USDC);
+      expect(gw.odometer.deps.ledger.available(remoteAgent.address)).toBe(1_000_000 - 10 - 3 * 50);
+
+      const rejected = await mcp.callTool("solana_rpc_economy", { method: "sendTransaction", params: ["AQ=="] });
+      expect(rejected.isError).toBe(true);
+      expect(rejected.paymentMade).toBe(false);
+    } finally {
+      await mcp.close();
+    }
+  });
+
   it("keeps the ledger reconciled with what moved on-chain", async () => {
     const topups = gw.odometer.deps.ledger.listTopups({ status: "settled" });
     const credited = topups.reduce((s, t) => s + Number(t.amount), 0);

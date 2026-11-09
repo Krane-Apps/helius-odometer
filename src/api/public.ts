@@ -39,6 +39,7 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
         topup: "/v1/topup",
         refunds: "/v1/refunds",
         bootstrap: config.bootstrapEnabled ? "/v1/bootstrap" : undefined,
+        mcp: config.remoteMcpEnabled ? "/mcp" : undefined,
       },
     }),
   );

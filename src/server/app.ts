@@ -18,6 +18,7 @@ import { Rebroadcaster } from "../routing/rebroadcast.js";
 import { Router } from "../routing/router.js";
 import { Upstream } from "../routing/upstream.js";
 import { registerAdminRoutes } from "../api/admin.js";
+import { registerRemoteMcp } from "../mcp/remote.js";
 import { registerPublicRoutes } from "../api/public.js";
 import { registerBootstrapRoutes } from "../rpc/bootstrap.js";
 import { registerRpcRoutes } from "../rpc/handler.js";
@@ -186,8 +187,17 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
         "x-odometer-max-price",
         "x-odometer-send-via",
         "x-odometer-rebroadcast",
+        "mcp-session-id",
+        "mcp-protocol-version",
       ],
-      exposeHeaders: ["payment-required", "payment-response", "x-payment-response", ...ODOMETER_HEADERS],
+      exposeHeaders: ["payment-required", "payment-response", "x-payment-response", "mcp-session-id", ...ODOMETER_HEADERS],
+    }),
+  );
+  app.use(
+    "/mcp",
+    bodyLimit({
+      maxSize: config.maxBodyBytes,
+      onError: (c) => jsonResponse(c, 413, { error: "body_too_large", maxBytes: config.maxBodyBytes }),
     }),
   );
   app.use(
@@ -202,6 +212,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
   registerBootstrapRoutes(app, deps);
   registerHeliusRestRoutes(app, deps);
   registerAdminRoutes(app, deps);
+  const closeRemoteMcp = config.remoteMcpEnabled ? registerRemoteMcp(app, deps) : async () => {};
   app.notFound((c) => jsonResponse(c, 404, { error: "not_found", docs: "/llms.txt" }));
   app.onError((err, c) => {
     logger.error("unhandled error", { path: c.req.path, error: err });
@@ -238,6 +249,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
       for (const t of timers) clearInterval(t);
       pool.stop();
       rebroadcaster.stop();
+      await closeRemoteMcp();
       ledger.close();
     },
   };

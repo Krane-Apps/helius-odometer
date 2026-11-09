@@ -76,6 +76,7 @@ export interface Config {
 
   adminToken?: string;
   bootstrapEnabled: boolean;
+  remoteMcpEnabled: boolean;
 }
 
 const bool = (fallback: boolean) =>
@@ -152,6 +153,7 @@ const EnvSchema = z.object({
 
   ADMIN_TOKEN: z.string().min(16).optional(),
   BOOTSTRAP_RPC_ENABLED: bool(true),
+  REMOTE_MCP_ENABLED: bool(true),
 });
 
 const PublicUpstreamSchema = z.object({
@@ -271,6 +273,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     maxPublicAttempts: e.MAX_PUBLIC_ATTEMPTS,
     adminToken: e.ADMIN_TOKEN,
     bootstrapEnabled: e.BOOTSTRAP_RPC_ENABLED,
+    remoteMcpEnabled: e.REMOTE_MCP_ENABLED,
   };
 }
 
