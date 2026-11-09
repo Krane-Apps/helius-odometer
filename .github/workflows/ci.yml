@@ -18,6 +18,8 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # The 2026-11-09 review's reproductions, kept as regression checks (they need the build).
+      - run: npm run test:audit
 
   e2e:
     runs-on: ubuntu-latest
