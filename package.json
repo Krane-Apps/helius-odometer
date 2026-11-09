@@ -1,0 +1,54 @@
+{
+  "name": "helius-odometer",
+  "version": "0.1.0",
+  "description": "Pay-per-call Solana RPC for AI agents over x402. Wallet in, answers out: no signup, no email, no API key.",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "helius-odometer": "dist/server/main.js",
+    "odometer-mcp": "dist/mcp/main.js",
+    "odometer-bench": "dist/bench/main.js",
+    "odometer-facilitator": "dist/facilitator/main.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./dist/client/index.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server/main.ts",
+    "start": "node dist/server/main.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:all": "npm run typecheck && npm test && npm run test:e2e",
+    "facilitator": "tsx src/facilitator/main.ts",
+    "mcp": "tsx src/mcp/main.ts",
+    "bench": "tsx src/bench/main.ts",
+    "localnet": "tsx scripts/localnet.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.6",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@solana/kit": "^8.6.0",
+    "@x402/core": "2.30.0",
+    "@x402/extensions": "2.30.0",
+    "@x402/fetch": "2.30.0",
+    "@x402/svm": "2.30.0",
+    "hono": "^4.13.17",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@solana-program/system": "^0.16.0",
+    "@solana-program/token": "^0.18.0",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
