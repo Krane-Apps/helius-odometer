@@ -91,6 +91,7 @@ export function createApp(opts: CreateAppOptions): OdometerApp {
       economyQueueMs: 1500,
       heliusQueueMs: 500,
       cacheMaxEntryBytes: 4 * 1024 * 1024,
+      sendPreflightCommitment: config.sendPreflightCommitment,
     },
   });
 

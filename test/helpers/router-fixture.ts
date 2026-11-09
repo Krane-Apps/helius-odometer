@@ -50,6 +50,7 @@ export function buildRouter(opts: FixtureOptions) {
       economyQueueMs: 200,
       heliusQueueMs: 100,
       cacheMaxEntryBytes: 100_000,
+      sendPreflightCommitment: "confirmed",
       ...opts.router,
     },
   });

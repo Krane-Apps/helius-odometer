@@ -67,6 +67,12 @@ export interface RouterOptions {
   /** How long a call may wait for a free Helius rate-limit token. */
   heliusQueueMs: number;
   cacheMaxEntryBytes: number;
+  /**
+   * Default `preflightCommitment` for sendTransaction when the caller set none and did not skip
+   * preflight. Solana defaults to finalized, which rejects blockhashes fetched at confirmed
+   * (the commitment this gateway itself normalizes getLatestBlockhash to).
+   */
+  sendPreflightCommitment?: Commitment;
 }
 
 export interface RouterDeps {
@@ -408,6 +414,20 @@ export class Router {
   ): Promise<RouteOutcome> {
     const { pool, txSessions, rebroadcaster } = this.deps;
     const target = ctx.sendVia === "sender" && pool.sender ? pool.sender : pool.helius;
+    let injected: RouteOutcome["injected"];
+    const preflight = this.deps.options.sendPreflightCommitment;
+    const sendParams = Array.isArray(payload.params) ? [...(payload.params as unknown[])] : undefined;
+    if (preflight && sendParams && typeof sendParams[0] === "string") {
+      const cfg = sendParams[1];
+      const next =
+        cfg === undefined ? {} : cfg && typeof cfg === "object" && !Array.isArray(cfg) ? { ...(cfg as Record<string, unknown>) } : undefined;
+      if (next && next.skipPreflight !== true && next.preflightCommitment === undefined) {
+        next.preflightCommitment = preflight;
+        sendParams[1] = next;
+        payload = { ...payload, params: sendParams };
+        injected = { commitment: preflight };
+      }
+    }
     const fail = (error: JsonRpcError, httpStatusHint: number, retryAfterMs?: number): RouteOutcome => {
       const latencyMs = performance.now() - started;
       this.deps.metrics.record(ctx.tier, spec.name, "none", latencyMs, false);
@@ -421,6 +441,7 @@ export class Router {
         attempts,
         httpStatusHint,
         retryAfterMs,
+        injected,
       };
     };
     if (!target) return fail(GATEWAY_ERRORS.allFailed, 503);
@@ -464,6 +485,7 @@ export class Router {
       escalated: false,
       sticky: false,
       attempts,
+      injected,
     };
   }
 }

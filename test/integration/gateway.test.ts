@@ -7,6 +7,10 @@ import { startMockRpc, type MockRpc } from "../helpers/mock-rpc.js";
 import { FakeFacilitator, FAKE_FEE_PAYER } from "../helpers/fake-facilitator.js";
 import { startApp, TEST_MINT, TEST_PAYTO, type StartedApp } from "../helpers/app-fixture.js";
 import { SOLANA_DEVNET } from "../../src/config.js";
+import { toSiwxSigner } from "../../src/client/signer.js";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const json = async (r: Response | Promise<Response>): Promise<any> => (await r).json();
 
 const BLOCKHASH = "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi";
 
@@ -80,9 +84,9 @@ describe("gateway (integration, fake facilitator)", () => {
   });
 
   it("serves the free discovery endpoints", async () => {
-    const index = await (await fetch(gw.url)).json();
+    const index = await json(fetch(gw.url));
     expect(index.tiers.map((t: { tier: string }) => t.tier).sort()).toEqual(["economy", "fast", "standard"]);
-    const pricing = await (await fetch(`${gw.url}/pricing`)).json();
+    const pricing = await json(fetch(`${gw.url}/pricing`));
     expect(pricing.methods.find((m: { method: string }) => m.method === "getAsset").priceUsd).toEqual({
       economy: "0.0002",
       standard: "0.0002",
@@ -90,9 +94,9 @@ describe("gateway (integration, fake facilitator)", () => {
     });
     const llms = await (await fetch(`${gw.url}/llms.txt`)).text();
     expect(llms).toContain("ask your user how important speed is");
-    const wk = await (await fetch(`${gw.url}/.well-known/x402`)).json();
+    const wk = await json(fetch(`${gw.url}/.well-known/x402`));
     expect(wk.resources.length).toBeGreaterThanOrEqual(4);
-    const health = await (await fetch(`${gw.url}/health`)).json();
+    const health = await json(fetch(`${gw.url}/health`));
     expect(health).toMatchObject({ ok: true, paymentsReady: true });
   });
 
@@ -140,37 +144,37 @@ describe("gateway (integration, fake facilitator)", () => {
     const replay = await rpc(gw.url, "economy", getSlot, { "payment-signature": header });
     expect(replay.status).toBe(402);
     expect(facilitator.settleCalls).toBe(settlesBefore);
-    const bal = await (await fetch(`${gw.url}/v1/balance`, { headers: { authorization: `Bearer ${token}` } })).json();
+    const bal = await json(fetch(`${gw.url}/v1/balance`, { headers: { authorization: `Bearer ${token}` } }));
     expect(bal).toMatchObject({ wallet: agent.address, availableMicros: 999_960, totalToppedUpUsd: "1" });
     expect(gw.odometer.deps.ledger.reconcile().ok).toBe(true);
   });
 
   it("signs in with SIWx, enforces single-use nonces and binds to the origin", async () => {
-    const challenge = (await (await fetch(`${gw.url}/v1/auth/challenge`)).json()) as SIWxExtension;
+    const challenge = (await json(fetch(`${gw.url}/v1/auth/challenge`))) as SIWxExtension;
     const info = { ...challenge.info, chainId: SOLANA_DEVNET, type: "ed25519" as const };
-    const payload = await createSIWxPayload(info, agent, `${gw.url}/v1/auth/session`);
+    const payload = await createSIWxPayload(info, toSiwxSigner(agent), `${gw.url}/v1/auth/session`);
     const header = encodeSIWxHeader(payload);
     const ok = await fetch(`${gw.url}/v1/auth/session`, { method: "POST", headers: { "sign-in-with-x": header } });
     expect(ok.status).toBe(200);
-    const body = await ok.json();
+    const body = await json(ok);
     expect(body.wallet).toBe(agent.address);
     expect(body.sessionToken).toMatch(/^odo1\./);
     const replay = await fetch(`${gw.url}/v1/auth/session`, { method: "POST", headers: { "sign-in-with-x": header } });
     expect(replay.status).toBe(401);
-    expect((await replay.json()).error).toBe("invalid_siwx_nonce");
+    expect((await json(replay)).error).toBe("invalid_siwx_nonce");
 
     // A proof minted for another origin is refused.
     const evilInfo = { ...info, domain: "evil.example", uri: "https://evil.example/v1/auth/session", nonce: "f".repeat(32) };
-    const evil = encodeSIWxHeader(await createSIWxPayload(evilInfo, agent, "https://evil.example/v1/auth/session"));
+    const evil = encodeSIWxHeader(await createSIWxPayload(evilInfo, toSiwxSigner(agent), "https://evil.example/v1/auth/session"));
     const refused = await fetch(`${gw.url}/v1/auth/session`, { method: "POST", headers: { "sign-in-with-x": evil } });
     expect(refused.status).toBe(401);
-    expect((await refused.json()).error).toBe("invalid_siwx_domain_mismatch");
+    expect((await json(refused)).error).toBe("invalid_siwx_domain_mismatch");
   });
 
   it("accepts SIWx directly on an RPC call for a funded wallet", async () => {
     const r402 = await rpc(gw.url, "economy", getSlot);
     const siwx = decodePaymentRequiredHeader(r402.h("payment-required")!).extensions!["sign-in-with-x"] as SIWxExtension;
-    const proof = await createSIWxPayload({ ...siwx.info, chainId: SOLANA_DEVNET, type: "ed25519" }, agent, `${gw.url}/v1/rpc/economy`);
+    const proof = await createSIWxPayload({ ...siwx.info, chainId: SOLANA_DEVNET, type: "ed25519" }, toSiwxSigner(agent), `${gw.url}/v1/rpc/economy`);
     const r = await rpc(gw.url, "economy", getSlot, { "sign-in-with-x": encodeSIWxHeader(proof) });
     expect(r.status).toBe(200);
     expect(r.h("x-odometer-session")).toMatch(/^odo1\./);
@@ -178,9 +182,9 @@ describe("gateway (integration, fake facilitator)", () => {
 
   it("tells an authenticated but empty wallet it needs a top-up", async () => {
     const empty = await generateKeyPairSigner();
-    const challenge = (await (await fetch(`${gw.url}/v1/auth/challenge`)).json()) as SIWxExtension;
-    const proof = await createSIWxPayload({ ...challenge.info, chainId: SOLANA_DEVNET, type: "ed25519" }, empty, `${gw.url}/v1/auth/session`);
-    const session = await (await fetch(`${gw.url}/v1/auth/session`, { method: "POST", headers: { "sign-in-with-x": encodeSIWxHeader(proof) } })).json();
+    const challenge = (await json(fetch(`${gw.url}/v1/auth/challenge`))) as SIWxExtension;
+    const proof = await createSIWxPayload({ ...challenge.info, chainId: SOLANA_DEVNET, type: "ed25519" }, toSiwxSigner(empty), `${gw.url}/v1/auth/session`);
+    const session = await json(fetch(`${gw.url}/v1/auth/session`, { method: "POST", headers: { "sign-in-with-x": encodeSIWxHeader(proof) } }));
     const r = await rpc(gw.url, "economy", getSlot, { authorization: `Bearer ${session.sessionToken}` });
     expect(r.status).toBe(402);
     expect(r.body).toMatchObject({ error: "insufficient_balance", wallet: empty.address, availableMicros: 0, priceMicros: 10 });
@@ -271,28 +275,28 @@ describe("gateway (integration, fake facilitator)", () => {
     const pr = decodePaymentRequiredHeader(challenge.headers.get("payment-required")!);
     const topup = await fetch(`${gw.url}/v1/topup`, { method: "POST", headers: { "payment-signature": payHeader(pr, wallet.address, 1) } });
     expect(topup.status).toBe(200);
-    const t = await topup.json();
+    const t = await json(topup);
     expect(t).toMatchObject({ wallet: wallet.address, availableUsd: "5" });
     const auth = { authorization: `Bearer ${t.sessionToken}`, "content-type": "application/json" };
 
     const refund = await fetch(`${gw.url}/v1/refunds`, { method: "POST", headers: auth, body: JSON.stringify({ amountUsd: 2 }) });
     expect(refund.status).toBe(201);
-    const { refund: rf } = await refund.json();
+    const { refund: rf } = await json(refund);
     expect(rf).toMatchObject({ amount: 2_000_000, destination: wallet.address, status: "requested" });
 
     const admin = { authorization: "Bearer admin-token-0123456789", "content-type": "application/json" };
     expect((await fetch(`${gw.url}/admin/stats`)).status).toBe(401);
-    const stats = await (await fetch(`${gw.url}/admin/stats`, { headers: admin })).json();
+    const stats = await json(fetch(`${gw.url}/admin/stats`, { headers: admin }));
     expect(stats.ledger.totals.fundedWallets).toBeGreaterThan(0);
     const paid = await fetch(`${gw.url}/admin/refunds/${rf.id}`, {
       method: "POST",
       headers: admin,
       body: JSON.stringify({ status: "paid", txSignature: "refund-sig" }),
     });
-    expect((await paid.json()).refund.status).toBe("paid");
-    const recon = await (await fetch(`${gw.url}/admin/reconcile`, { method: "POST", headers: admin })).json();
+    expect((await json(paid)).refund.status).toBe("paid");
+    const recon = await json(fetch(`${gw.url}/admin/reconcile`, { method: "POST", headers: admin }));
     expect(recon.ok).toBe(true);
-    const bal = await (await fetch(`${gw.url}/v1/balance`, { headers: auth })).json();
+    const bal = await json(fetch(`${gw.url}/v1/balance`, { headers: auth }));
     expect(bal.availableUsd).toBe("3");
   });
 
@@ -332,7 +336,7 @@ describe("gateway (integration, fake facilitator)", () => {
   });
 
   async function whoami(token: string): Promise<{ wallet: string }> {
-    return (await fetch(`${gw.url}/v1/balance`, { headers: { authorization: `Bearer ${token}` } })).json();
+    return json(fetch(`${gw.url}/v1/balance`, { headers: { authorization: `Bearer ${token}` } }));
   }
 });
 
@@ -357,7 +361,7 @@ describe("gateway limits", () => {
   });
 
   it("only enables tiers the configured upstreams can serve", async () => {
-    const index = await (await fetch(gw.url)).json();
+    const index = await json(fetch(gw.url));
     expect(index.tiers.map((t: { tier: string }) => t.tier)).toEqual(["economy"]);
     const r = await rpc(gw.url, "economy", { jsonrpc: "2.0", id: 1, method: "getAsset", params: { id: "x" } });
     expect(r.status).toBe(503);

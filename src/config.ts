@@ -65,6 +65,7 @@ export interface Config {
   walletDailyCapUsd: number;
   defaultCommitment: Record<Tier, Commitment | undefined>;
   minContextSlotMargin: number;
+  sendPreflightCommitment?: Commitment;
 
   healthPollMs: number;
   heliusHealthPollMs: number;
@@ -138,6 +139,7 @@ const EnvSchema = z.object({
   STANDARD_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
   FAST_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("none"),
   MIN_CONTEXT_SLOT_MARGIN: int(4),
+  SEND_PREFLIGHT_COMMITMENT: z.enum(["processed", "confirmed", "finalized", "none"]).default("confirmed"),
 
   HEALTH_POLL_MS: int(2000),
   HELIUS_HEALTH_POLL_MS: int(30_000),
@@ -260,6 +262,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       fast: commitment(e.FAST_COMMITMENT),
     },
     minContextSlotMargin: e.MIN_CONTEXT_SLOT_MARGIN,
+    sendPreflightCommitment: commitment(e.SEND_PREFLIGHT_COMMITMENT),
     healthPollMs: e.HEALTH_POLL_MS,
     heliusHealthPollMs: e.HELIUS_HEALTH_POLL_MS,
     maxSlotLag: e.MAX_SLOT_LAG,
