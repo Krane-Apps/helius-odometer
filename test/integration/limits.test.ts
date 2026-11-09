@@ -33,6 +33,14 @@ describe("rate limits", () => {
     await pub.close();
   });
 
+  it("omits Bazaar discovery metadata unless the operator opts in", async () => {
+    const res = await post(gw.url, getSlot);
+    const pr = decodePaymentRequiredHeader(res.headers.get("payment-required")!);
+    expect(pr.extensions?.bazaar).toBeUndefined();
+    expect(pr.extensions?.["sign-in-with-x"]).toBeDefined();
+    await new Promise((r) => setTimeout(r, 2100));
+  });
+
   it("limits payment challenges per IP even when a bogus credential is sent", async () => {
     const statuses: number[] = [];
     for (let i = 0; i < 4; i++) {

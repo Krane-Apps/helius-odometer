@@ -133,8 +133,9 @@ export class Payments {
 
     this.resourceServer = new x402ResourceServer(facilitator)
       .register(config.network as Network, new CachedBlockhashExactSvmScheme(opts.blockhashes))
-      .registerExtension(bazaarResourceServerExtension)
       .registerExtension(createSIWxResourceServerExtension({ storage: NO_GRANT_STORAGE, origin: config.publicOrigin }));
+    // Bazaar metadata lets facilitators catalog this service publicly: a listing, so opt-in only.
+    if (config.bazaarEnabled) this.resourceServer.registerExtension(bazaarResourceServerExtension);
 
     const decimals = config.paymentAssetDecimals;
     this.resourceServer.onBeforeSettle(async (ctx) => {
@@ -235,7 +236,7 @@ export class Payments {
           statement: "Sign in to Helius Odometer to spend your prepaid RPC balance",
           expirationSeconds: 300,
         }),
-        ...bazaar,
+        ...(config.bazaarEnabled ? bazaar : {}),
       },
     };
   }

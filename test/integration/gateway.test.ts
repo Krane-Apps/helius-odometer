@@ -72,6 +72,7 @@ describe("gateway (integration, fake facilitator)", () => {
         HELIUS_RPC_URL: hel.url,
         WALLET_RPS: "1000",
         IP_RPS: "1000",
+        BAZAAR_DISCOVERY: "true",
       },
       facilitator,
     );
