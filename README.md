@@ -4,13 +4,14 @@
 
 An agent pays in USDC from its own wallet, picks a speed tier, and gets routed accordingly: cheap reads from free public RPC, everything that needs it through Helius (DAS, `getProgramAccounts`, staked `sendTransaction`). It pays once on-chain for a prepaid top-up, then every call is debited from that balance in a single HTTP round trip.
 
-> **Status:** working prototype, not deployed. Commercial launch is gated on written permission from Helius (see [the permission gate](docs/PLAN.md#the-permission-gate-unresolved-and-it-gates-launch)). This is an independent project, not affiliated with or endorsed by Helius.
+> **Status:** working prototype, not deployed, not taking deposits. The fixes from the [2026-11-09 code review](docs/reviews/2026-11-09-code-review.md) are in ([response](docs/reviews/2026-11-09-response.md)). Commercial launch is gated on written permission from Helius (see [the permission gate](docs/PLAN.md#the-permission-gate-unresolved-and-it-gates-launch)) and an approved live pilot. This is an independent project, not affiliated with or endorsed by Helius.
 
 ## What works today
 
 - **x402 v2 payments on Solana** with the official `@x402/*` SDKs: 402 challenges, USDC `exact` top-ups settled before the call is served, replay-proof crediting.
 - **Three tiers.** `economy` uses free public RPC only. `standard` uses public RPC and falls back to Helius automatically. `fast` always uses Helius. Helius-only methods (DAS, indexes) cost the same on every tier.
-- **Prepaid balance ledger** on SQLite: reserve, then debit only what was served, so gateway and upstream delivery failures are never charged. Idempotent receipts, refunds, daily caps, and a reconciliation job that proves balances equal their journal.
+- **Prepaid balance ledger** on SQLite: reserve, then debit only what was served, so gateway and upstream delivery failures are never charged. The debit and its replay receipt commit together, restarts release interrupted requests uncharged, and one process owns the ledger. Refunds, daily caps, and a reconciliation job that proves balances equal their journal.
+- **Operator safety:** ambiguous settlements are frozen for review and credited once against the original receipt with on-chain evidence; alerts go to a webhook; `GET /admin/readiness` checks the launch gates, including custody on-chain against what agents are owed.
 - **Agent identity without accounts.** Sign-In-With-X (SIWS) proofs are bound to the gateway origin with single-use nonces. Short-lived session tokens remove the per-call 402 round trip.
 - **Routing safeguards** from mature routers: health polling, slot-lag ejection, 429 cooling, per-upstream rate limits, commitment normalization, per-wallet `minContextSlot` floors, a finalized-data cache, sticky transaction follow-ups, and single-attempt `sendTransaction`.
 - **Every integration path an agent might use:** plain HTTP with any x402 client, a TypeScript client with a `@solana/kit` transport, a local MCP server (stdio), and a remote MCP endpoint paid over the x402 MCP transport.
@@ -101,7 +102,7 @@ const { result, meta } = await odometer.rpc("getBalance", [address]);
 const rpc = createSolanaRpcFromTransport(odometer.transport("economy"));
 ```
 
-The client signs in once with SIWx and reuses the session token. It pays a top-up only when the balance runs out, within your limits, and it pays only in known USDC mints unless you allow another asset explicitly.
+The client signs in once with SIWx and reuses the session token. It pays a top-up only when the balance runs out, within your limits, and it pays only in known USDC mints unless you allow another asset explicitly. Top-ups run one at a time, and each is counted against `maxSpendUsd` before it is signed and stays counted even if its response is lost. The count lives in the client instance: pass `initialSpentMicros` and `onSpendChange` to keep it across restarts.
 
 ### MCP
 
@@ -112,10 +113,14 @@ claude mcp add helius-odometer \
   -e ODOMETER_URL=https://odometer.example.com \
   -e ODOMETER_WALLET_KEY=/path/to/agent-keypair.json \
   -e ODOMETER_MAX_TOPUP_USD=5 \
+  -e ODOMETER_MAX_SPEND_USD=20 \
+  -e ODOMETER_SPEND_FILE=/path/to/odometer-spend.json \
   -- npx tsx /path/to/helius-odometer/src/mcp/main.ts
 ```
 
-**Remote**: `https://odometer.example.com/mcp` speaks streamable-HTTP MCP and is paid over the x402 MCP transport. The first paid tool call asks for a top-up. After that, the paying wallet is bound to the MCP session and later calls spend its balance.
+`ODOMETER_SPEND_FILE` keeps the `ODOMETER_MAX_SPEND_USD` budget across restarts of the bridge.
+
+**Remote**: `https://odometer.example.com/mcp` speaks streamable-HTTP MCP and is paid over the x402 MCP transport. The first paid tool call asks for a top-up. After that, the session may spend what it paid, from the same IP, until it expires; revoking the wallet ends it at once. A client that sends `Authorization: Bearer <session token>` spends the wallet's full balance instead.
 
 Both expose one tool per tier (`solana_rpc_economy`, `solana_rpc_standard`, `solana_rpc_fast`). Each tool description tells the agent to ask its user how important speed is before it picks one. `odometer_balance`, `odometer_pricing` and `odometer_topup` round out the set.
 
@@ -167,6 +172,9 @@ All configuration is environment variables; [.env.example](.env.example) documen
 | `PUBLIC_UPSTREAMS` | Free public RPC pool for `economy` and `standard`. Review each provider's terms first. |
 | `ENABLE_SEND_TRANSACTION` | Off until Helius confirms its staked paths may be fronted. |
 | `BAZAAR_DISCOVERY` | Off: Bazaar metadata lets facilitators list the service publicly. |
+| `WALLET_DAILY_CAP_USD` | Operator ceiling per wallet per UTC day. Wallets can lower their own cap or stop spending, never lift it. |
+| `SERVICE_NAME` | Public name on every surface. Keep it neutral until the Helius name is approved. |
+| `ALERT_WEBHOOK_URL` | Where operator alerts go (Slack-compatible or a pager bridge). |
 
 Operations, deployment and the admin API are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
@@ -177,9 +185,10 @@ Operations, deployment and the admin API are in [docs/OPERATIONS.md](docs/OPERAT
 | `POST /v1/rpc/{tier}` | Paid JSON-RPC (single or batch) |
 | `POST /v1/topup` | Pay a top-up without making a call |
 | `GET /v1/auth/challenge`, `POST /v1/auth/session` | SIWx sign-in, returns a session token |
-| `GET /v1/balance` | Balance, daily cap, totals |
+| `GET /v1/balance` | Balance, daily caps, totals |
+| `GET /v1/receipts?requestId=` or `?idempotencyKey=` | Whether a request was charged, for a client whose response was lost |
 | `POST /v1/refunds`, `GET /v1/refunds` | Request a refund of unused balance |
-| `POST /v1/account/cap` | Lower this wallet's daily cap |
+| `POST /v1/account/cap` | Set this wallet's own daily cap: `0` stops spending, `null` removes it. The operator ceiling always applies. |
 | `POST /v1/session/revoke` | Revoke every session token for this wallet |
 | `POST /v1/bootstrap` | Free, rate-limited RPC for building the payment itself |
 | `POST /v1/helius/v0/transactions`, `GET /v1/helius/v0/addresses/{address}/transactions` | Helius Enhanced Transactions behind the same balance |
@@ -205,7 +214,11 @@ npm test
 npm run test:e2e
 ```
 
-Unit and integration tests cover the ledger, pricing, routing, consistency, sessions, SIWx and the full HTTP gateway against mock upstreams and a fake facilitator. The end-to-end suite runs a real `solana-test-validator` with a real SPL mint and the official x402 facilitator code. It covers on-chain top-ups, balance debits, tier routing, landing a transaction, stock x402 HTTP and MCP clients, MCP agents, replay protection, and reconciling the ledger against the chain. CI runs all of it. More in [docs/TESTING.md](docs/TESTING.md).
+```bash
+npm run build && npm run test:audit
+```
+
+Unit and integration tests cover the ledger, pricing, routing, consistency, sessions, SIWx and the full HTTP gateway against mock upstreams and a fake facilitator. They include crash and restart cases on a file-backed ledger, backup and restore, ambiguous and late settlements, alert delivery, receipts and readiness. The end-to-end suite runs a real `solana-test-validator` with a real SPL mint and the official x402 facilitator code. It covers on-chain top-ups, balance debits, tier routing, landing a transaction, stock x402 HTTP and MCP clients, MCP agents, replay protection, operator verification of a top-up, and reconciling the ledger and custody against the chain. `test:audit` runs the review's reproduction scripts, which now require the fixed behavior. CI runs all of it and fails, rather than skips, if the validator is missing. More in [docs/TESTING.md](docs/TESTING.md).
 
 ## Project layout
 
@@ -235,6 +248,7 @@ docs/            plan, architecture, operations, testing, pitch draft
 | 1: paid MVP | Built and tested end to end. |
 | 2: routing engine, three tiers | Built and tested. `sendTransaction` stays disabled until Helius confirms Sender may be fronted. |
 | 3: scale and settlement | Spend caps, refunds and funnel stats are built. Batch-settlement channels are documented as the next payment option, pending verified facilitator support. Scale-up waits on Helius. |
+| Review fixes (2026-11-09) | All P1 and P2 findings fixed and tested ([response](docs/reviews/2026-11-09-response.md)). Not validated: live Helius, mainnet payments and refunds, a live pilot. |
 
 ## Guardrails
 

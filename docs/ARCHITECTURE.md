@@ -36,9 +36,11 @@ Settlement hooks on the x402 resource server (`src/payments/x402.ts`) drive the 
 |---|---|
 | `onBeforeSettle` | Record the attempt keyed by the SHA-256 of the signed payload. A payload that already settled is refused (replay); one in flight is refused (race). |
 | `onAfterSettle` | Check payTo and asset match the configuration, then credit the payer once. Idempotent on both the payload hash and the transaction signature. |
-| `onSettleFailure` | Mark the attempt failed so the same signed payload may be retried. |
+| `onSettleFailure` | Classify the failure (`src/payments/settle-outcome.ts`). A definitive failure (invalid payload, insufficient funds, a request that never left) marks the attempt failed, so the same signed payload may be retried. An ambiguous one (timeout, `settlement_pending`, a broadcast transaction that did not confirm) marks it `needs_review` with any transaction signature and payer, freezes it, and raises an alert. |
 
-If crediting fails after money moved, the hook throws `AfterSettleAbortError`. The settlement is reported as failed to the client with its transaction signature, the top-up is flagged `needs_review`, and a structured log line records it for recovery. Top-ups stuck in `settling` for 10 minutes are flagged by reconciliation.
+A frozen payment is not settled again: resending it answers 402 `payment_under_review`, and the client gets 502 `settlement_unknown` rather than a definitive failure. An operator resolves it once, against the original receipt and with on-chain evidence (`POST /admin/topups/{id}/resolve`). A payment that settles after an operator rejected it goes back to review instead of crediting.
+
+If crediting fails after money moved, the hook throws `AfterSettleAbortError`. The settlement is reported as failed to the client with its transaction signature, the top-up is flagged `needs_review`, and a critical alert fires. Top-ups stuck in `settling` for 10 minutes count as unresolved in reconciliation.
 
 ### Identity: SIWx and sessions
 
@@ -48,7 +50,9 @@ If crediting fails after money moved, the hook throws `AfterSettleAbortError`. T
 ### MCP
 
 - **Local** (`src/mcp/main.ts`): an stdio MCP server wrapping `OdometerClient`. The key and spend limits live in the agent's process.
-- **Remote** (`src/mcp/remote.ts`): streamable-HTTP MCP at `/mcp`. A tool call without balance returns an x402 `PaymentRequired` tool result for a top-up. When the client retries with `_meta["x402/payment"]`, the top-up settles through the same hooks, the payer is bound to that MCP session, and later calls in the session spend the balance. The x402 MCP transport has no sign-in mechanism, so a new session pays again; the money lands in the same refundable balance.
+- **Remote** (`src/mcp/remote.ts`): streamable-HTTP MCP at `/mcp`. A tool call without balance returns an x402 `PaymentRequired` tool result for a top-up. When the client retries with `_meta["x402/payment"]`, the top-up settles through the same hooks and the payer is bound to that MCP session. The x402 MCP transport has no sign-in mechanism, so a new session pays again; the money lands in the same refundable balance.
+
+  An MCP session id is not a wallet credential. The binding lets a session spend at most what it paid (its voucher), and every paid call re-checks it: the wallet's session epoch must be unchanged (revoking the wallet ends every session at once), the binding must be within its absolute lifetime (`REMOTE_MCP_SESSION_TTL_SECONDS`), and with `REMOTE_MCP_BIND_IP` the call must come from the IP that paid. A client that sends `Authorization: Bearer <session token>` spends the wallet's full balance under the token's own checks. Session creation is rate-limited per IP and capped in total. Tool calls accept the same `maxPriceUsd` and `idempotencyKey` controls as HTTP.
 
 ## Routing
 
@@ -106,11 +110,17 @@ With `X-Odometer-Rebroadcast: true`, a landed `sendTransaction` is re-sent (same
 - Amounts are integer micros (1e-6 USD), exactly one atomic unit of USDC.
 - `accounts.balance` includes reserved funds; `available = balance - reserved`. Constraints keep both non-negative and `reserved <= balance`.
 - Every balance change writes an append-only `journal` row with a unique `(kind, ref)` receipt: `topup`, `debit`, `refund`, `refund_reversal`, `adjustment`. Replays cannot double-credit or double-debit.
+- **Charge and receipt together.** The debit and the request's replay receipt (for an `Idempotency-Key`) are written in one transaction. A crash leaves both or neither: a charged request always replays its stored answer, and an uncharged one runs again. `GET /v1/receipts` answers "was this charged?" by request id or idempotency key, within the retention windows (`IDEMPOTENCY_RETENTION_HOURS`, `RESERVATION_RETENTION_DAYS`).
+- **Restart recovery.** At startup every open reservation is released uncharged (whatever its timestamp) and every in-flight idempotency key is marked aborted, so a retry runs again instead of waiting forever.
+- **One writer.** SQLite plus in-memory sessions, rate limits and reservations assume one process. A heartbeated lock row refuses a second gateway on the same database, and a process that loses the lock exits.
+- **Manual credits** (`adjust`) are refused while a top-up that could credit the wallet is settling or under review: recovering a payment that way would let its receipt be credited again later.
 - Reconciliation, run every 60 s and on demand via `POST /admin/reconcile`, checks:
   - every balance equals the sum of its journal;
   - every reserved amount equals its open reservations;
-  - stale reservations (over 2 minutes, or anything left by a previous process at startup) are released;
-  - stuck settlements are flagged.
+  - stale reservations (over 2 minutes) are released;
+  - top-ups with an unknown outcome are counted, with their amount, as unresolved.
+
+  It reports `arithmeticOk`, `unresolvedTopups`, `pendingRefunds` and `liabilitiesMicros` (balances plus pending refunds). `ok` is true only when the arithmetic holds and nothing is unresolved. This is a local check: it does not read the chain. `GET /admin/readiness` adds the on-chain side (custody against liabilities) and the other launch gates.
 - Refund requests move funds out of the available balance immediately. Rejecting a request re-credits them; marking it paid records the payout transaction.
 
 ## Billing verdicts
@@ -133,14 +143,15 @@ Two consequences of this contract are easy to misread:
 ## Security model
 
 - The gateway never holds client keys. Clients sign their own payment transactions and SIWx messages.
-- A session token or a remote MCP session id is a bearer credential that can spend one wallet's prepaid balance until it expires. Serve only over TLS. Per-wallet daily caps (`WALLET_DAILY_CAP_USD`, lowerable per wallet) bound the damage of a leaked token.
+- A session token is a bearer credential that can spend one wallet's prepaid balance until it expires or the wallet revokes it. A remote MCP session id can spend only what that session paid, from the IP that paid, until its absolute expiry or a revocation. Serve only over TLS. The operator's daily ceiling (`WALLET_DAILY_CAP_USD`) bounds every wallet; a wallet can lower its own cap or set `0` to stop spending, but never lift the ceiling.
+- The TypeScript client counts every signed top-up against `maxSpendUsd` before signing, one top-up at a time, and keeps a payment counted even if its response is lost. The count lives in memory: pass `initialSpentMicros` and `onSpendChange` to make it durable (the MCP bridge does this with `ODOMETER_SPEND_FILE`).
 - Payment requirements are built server-side, and settled requirements are re-checked against the configured payTo and asset before crediting.
 - The admin API uses a constant-time token comparison and is disabled unless `ADMIN_TOKEN` is set.
 - Upstream URLs, which may contain API keys, never appear in logs, `/status` or benchmark reports.
 
 ## Limits of this version
 
-- **Single process.** SQLite and in-memory caches (sessions, rate limits, high-water marks, MCP sessions) assume one instance. Horizontal scale needs a shared ledger such as Postgres, and shared rate limits.
+- **Single process.** SQLite and in-memory caches (sessions, rate limits, high-water marks, MCP sessions) assume one instance, and the writer lock enforces it. Horizontal scale needs a shared ledger such as Postgres, and shared rate limits.
 - **No WebSocket subscriptions.** HTTP JSON-RPC only.
 - **Prices assume a 6-decimal stablecoin.**
 - **Batch-settlement payment channels** (x402 `batch-settlement` scheme) are the natural next payment option once Solana facilitator support is verified in production. They would replace top-ups with per-call vouchers and periodic on-chain claims.

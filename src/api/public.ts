@@ -328,7 +328,8 @@ A charged sendTransaction means the RPC accepted it, not that it landed. Your tr
 ## Endpoints
 - GET /pricing   per-method prices for every tier
 - GET /status    measured latency and upstream health
-- GET /v1/balance, POST /v1/refunds, POST /v1/account/cap (authenticated)
+- GET /v1/balance, GET /v1/receipts, POST /v1/refunds, POST /v1/account/cap (authenticated)
+- Lost a response? Retry with the same Idempotency-Key (it replays the stored answer without a second charge), or ask GET /v1/receipts?requestId=<X-Odometer-Request-Id>
 - POST /v1/topup  top up without making a call
 ${config.bootstrapEnabled ? "- POST /v1/bootstrap  free getLatestBlockhash and payment-mint lookup for building the payment\n" : ""}
 ## Notes

@@ -10,6 +10,9 @@ Everything here describes how to run the gateway. Buying a Helius plan, funding 
 4. **Choose a facilitator.** Any x402 v2 facilitator with Solana mainnet `exact` support works. Compare live fee schedules and terms (Coinbase CDP, PayAI, others), or self-host with `npm run facilitator` and a funded fee-payer key.
 5. **Create the operator wallet's USDC token account** (`PAYTO_ADDRESS`). Top-up transfers fail if the destination associated token account does not exist.
 6. **Generate secrets:** `SESSION_SECRET` (32+ characters) and `ADMIN_TOKEN` (16+ characters).
+7. **Route alerts to a person:** set `ALERT_WEBHOOK_URL` (a Slack-compatible incoming webhook or a pager bridge). Without it, alerts only reach the logs.
+8. **Use a neutral public name** in `SERVICE_NAME` until the Helius name is approved for this use. It appears on the paywall page, the index, `llms.txt`, the SIWx sign-in statement and Bazaar metadata.
+9. **Check readiness:** `GET /admin/readiness` must answer `"ready": true` before taking deposits (below).
 
 ## Running
 
@@ -23,7 +26,9 @@ docker build -t helius-odometer .
 docker run -d --name odometer -p 8787:8787 --env-file .env -v odometer-data:/data helius-odometer
 ```
 
-The image runs as the non-root `node` user, stores the ledger at `/data/odometer.db`, and has a health check on `/health`. Put it behind a TLS-terminating proxy, set `PUBLIC_ORIGIN` to the public `https://` origin, and set `TRUST_PROXY=true` only if the proxy sets `X-Forwarded-For`.
+The image runs as the non-root `node` user, stores the ledger at `/data/odometer.db`, and has a health check on `/health`. Put it behind a TLS-terminating proxy, set `PUBLIC_ORIGIN` to the public `https://` origin, and set `TRUST_PROXY=true` only if the proxy overwrites `X-Forwarded-For`.
+
+Run exactly one gateway process per database. A second process against the same file refuses to start (`ledger_locked`). Deploy by stopping the old process before starting the new one: a clean stop releases the lock at once, while a crashed process holds it until its heartbeat is 30 s old. If a stalled process loses the lock to another, it raises an alert and exits.
 
 ### Directly
 
@@ -67,8 +72,40 @@ It prints p50, p95 and p99 latency, 429 and error counts per upstream and method
 | `GET /health` | `paymentsReady` (facilitator synced), upstream availability |
 | `GET /status` | Measured latency per tier, method and upstream class; upstream health and slot lag |
 | `GET /admin/stats` | Funnel (challenges, sign-ins, top-ups, funded and spending wallets), revenue, Helius credit estimate, top-up status counts |
+| `GET /admin/readiness` | The launch gates the gateway can check itself (below) |
 
-Logs are one JSON object per line. Alert on `ledger reconciliation mismatch`, `top-up settled but not recorded`, and `upstream ejected` (when sustained).
+### Alerts
+
+Every alert is logged as `ALERT <message>`. With `ALERT_WEBHOOK_URL` set it is also POSTed as JSON (`service`, `severity`, `key`, `message`, `details`, `at`, and a `text` line for Slack-style webhooks), with `ALERT_WEBHOOK_AUTH_HEADER` as its `Authorization` header if set. Repeats of one key are suppressed for `ALERT_DEDUPE_MINUTES` (default 15).
+
+| Key | Severity | Meaning | Do |
+|---|---|---|---|
+| `settlement:<payload hash>` | critical | A top-up's settlement outcome is unknown; the payment is frozen | [needs_review runbook](#a-top-up-is-flagged-needs_review) |
+| `unrecorded:<signature>` | critical | Funds settled on-chain but the ledger could not record the credit | [needs_review runbook](#a-top-up-is-flagged-needs_review) |
+| `reconcile-mismatch` | critical | A balance disagrees with its journal | [mismatch runbook](#reconciliation-reports-a-mismatch) |
+| `reconcile-unresolved` | warning | Top-ups with an unknown outcome are waiting for review | [needs_review runbook](#a-top-up-is-flagged-needs_review) |
+| `writer-lock` | critical | Another process took over the ledger; this one exits | Find the second instance |
+
+Logs are one JSON object per line. Also watch for sustained `upstream ejected`.
+
+### Readiness
+
+`GET /admin/readiness` answers `ready` plus one result per check. `fail` means do not take deposits; `warn` is advisory.
+
+| Check | Fails when |
+|---|---|
+| `facilitator` | The facilitator is not synced, or offers no Solana fee payer |
+| `public_origin` | `PUBLIC_ORIGIN` is not HTTPS on mainnet (a warning elsewhere) |
+| `storage` | The ledger is in memory |
+| `session_secret` | `SESSION_SECRET` is not set |
+| `writer_lock` | This process does not hold the ledger's writer lock |
+| `ledger_arithmetic` | A balance disagrees with its journal, or reserved funds with open reservations |
+| `unresolved_topups` | Any top-up's outcome is unknown |
+| `custody` | `PAYTO_ADDRESS` has no associated token account for the payment asset, holds less than agents are owed (balances plus pending refunds, at `confirmed`), or cannot be read |
+
+Warnings: `alerts` (no webhook), `network` (not mainnet USDC), `public_listing` (Bazaar on), `send_transaction` (enabled), `branding` (the public name includes Helius).
+
+Readiness does not cover what needs a human: upstream permission, terms, facilitator fees, a restore drill, and the refund policy.
 
 If the facilitator is unreachable, funded wallets keep working. Only new top-ups fail, with a 503 and `Retry-After`.
 
@@ -80,13 +117,14 @@ All requests need `Authorization: Bearer $ADMIN_TOKEN`.
 |---|---|
 | `GET /admin/stats` | Funnel, revenue, credit estimate, upstreams |
 | `GET /admin/accounts/{wallet}` | Balance, journal, top-ups, refunds for one wallet |
-| `POST /admin/accounts/{wallet}/adjust` `{"amountUsd": 1.5, "note": "..."}` | Journaled goodwill credit or debit. Never use it to recover a top-up; it is refused while the wallet has unresolved top-ups. |
+| `POST /admin/accounts/{wallet}/adjust` `{"amountUsd": 1.5, "note": "..."}` | Journaled goodwill credit or debit. Never use it to recover a top-up: a credit is refused (409 `unresolved_topups`) while a top-up that could credit the wallet is settling or under review. Set `acknowledgeUnresolvedTopups: true` only for a credit unrelated to any top-up. |
 | `GET /admin/topups?status=needs_review` | Settlements that need a human |
 | `GET /admin/topups/{id}/verify` | On-chain evidence for a top-up: finalized, successful, amount received by `PAYTO_ADDRESS`, payer |
 | `POST /admin/topups/{id}/resolve` `{"action": "credit", "note": "..."}` | Credit the original receipt once, after the evidence matches. `"reject"` records that nothing moved. |
 | `GET /admin/refunds?status=requested` | Refund queue |
 | `POST /admin/refunds/{id}` `{"status": "paid", "txSignature": "..."}` | Record a refund payout (or `"rejected"` to re-credit) |
-| `POST /admin/reconcile` | Run reconciliation now |
+| `POST /admin/reconcile` | Run reconciliation now: local arithmetic, unresolved top-ups, liabilities |
+| `GET /admin/readiness` | Pre-deposit checks, including custody read from the chain |
 
 ## Runbooks
 
@@ -108,6 +146,10 @@ The amount has already left the wallet's available balance. Send USDC from the o
 
 Stop taking traffic, back up the database, and compare the wallet's `journal` with `accounts`. Reconciliation never auto-corrects balances, because a silent fix would hide a bug.
 
+### The gateway refuses to start with `ledger_locked`
+
+Another process holds the ledger. Check for a second instance or container on the same volume. If the previous process crashed, start again once its heartbeat is 30 s old.
+
 ### Rotating secrets
 
 - Rotating `SESSION_SECRET` logs every agent out. They sign in again automatically.
@@ -115,4 +157,14 @@ Stop taking traffic, back up the database, and compare the wallet's `journal` wi
 
 ## Backups
 
-The ledger is a single SQLite file in WAL mode. Back it up with `sqlite3 /data/odometer.db ".backup /backups/odometer-$(date +%F).db"`, or snapshot the volume. Balances are liabilities to agents, so treat this file like a financial record.
+The ledger is a single SQLite file in WAL mode. Back it up while the gateway runs with `sqlite3 /data/odometer.db ".backup /backups/odometer-$(date +%F).db"` (or `Ledger.backup(path)` from code), or snapshot the volume. Balances are liabilities to agents, so treat this file like a financial record.
+
+### Restoring
+
+1. Stop the gateway. Replace the database file with the backup, and delete any `-wal` and `-shm` files next to it.
+2. Start the gateway. Startup releases, uncharged, any request that was in flight when the backup was taken.
+3. A top-up that was settling at backup time now shows as unresolved. Resolve it first, with verify and resolve; adjustments are refused until then.
+4. Anything after the backup is missing from the ledger. Top-ups matter most, because agents paid real USDC. List the incoming transfers to the operator's token account since the backup time (an explorer, or `getSignaturesForAddress`). Credit each payment not in `GET /admin/topups` once, with a journaled adjustment that names its signature. Debits after the backup are lost revenue, not a loss to agents.
+5. `GET /admin/readiness` should then show matching arithmetic, no unresolved top-ups, and custody covering liabilities.
+
+Practice a restore before taking deposits.
