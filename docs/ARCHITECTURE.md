@@ -101,7 +101,7 @@ Anything not in the catalog is refused with `-32601`, so the gateway is never an
 
 ### Optional rebroadcast
 
-With `X-Odometer-Rebroadcast: true`, a landed `sendTransaction` is re-sent (same bytes, same upstream, `skipPreflight`) every 2 s until it confirms, its blockhash expires, or `REBROADCAST_MAX_SECONDS` passes. Re-sending identical bytes is idempotent on-chain.
+With `X-Odometer-Rebroadcast: true`, an accepted `sendTransaction` is re-sent (same bytes, `skipPreflight`, `maxRetries: 0`) every 2 s until it confirms, its blockhash expires, or `REBROADCAST_MAX_SECONDS` passes. Resends go to the route that accepted the transaction: Helius RPC by default, or Helius Sender when the call set `X-Odometer-Send-Via: sender`. Status and blockhash checks always use Helius RPC, because Sender only accepts `sendTransaction`. Jobs live in memory and end with the process. Re-sending identical bytes is idempotent on-chain.
 
 ## Ledger
 

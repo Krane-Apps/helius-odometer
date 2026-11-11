@@ -469,7 +469,8 @@ export class Router {
             rawTx: params[0],
             encoding,
             blockhash: decoded.recentBlockhash,
-            upstream: pool.helius,
+            upstream: target ?? pool.helius,
+            statusUpstream: pool.helius,
           });
         } catch (err) {
           this.deps.logger.debug("rebroadcast skipped", { error: err instanceof Error ? err.message : String(err) });

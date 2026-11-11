@@ -2,6 +2,7 @@ import { UpstreamPool } from "../../src/routing/pool.js";
 import { Upstream } from "../../src/routing/upstream.js";
 import { Router, type RouterOptions } from "../../src/routing/router.js";
 import { LatencyMetrics } from "../../src/routing/metrics.js";
+import type { Rebroadcaster } from "../../src/routing/rebroadcast.js";
 import { SlotHighWaterMarks, TxSessions } from "../../src/routing/consistency.js";
 import { LruCache } from "../../src/util/lru.js";
 import { silentLogger } from "../../src/util/log.js";
@@ -12,6 +13,7 @@ export interface FixtureOptions {
   helius?: { url: string; rps?: number; sendRps?: number; heavyRps?: number };
   sender?: { url: string };
   router?: Partial<RouterOptions>;
+  rebroadcaster?: Rebroadcaster;
   maxSlotLag?: number;
 }
 
@@ -42,6 +44,7 @@ export function buildRouter(opts: FixtureOptions) {
     hwm,
     txSessions,
     cache,
+    rebroadcaster: opts.rebroadcaster,
     logger: silentLogger,
     options: {
       defaultCommitment: { economy: "confirmed", standard: "confirmed", fast: undefined },

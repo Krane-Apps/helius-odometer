@@ -6,16 +6,20 @@ interface Job {
   rawTx: string;
   encoding: "base64" | "base58";
   blockhash: string;
+  /** Where the transaction was first sent, and where every resend goes. */
   upstream: Upstream;
+  /** Where status and blockhash are read. Helius Sender only accepts sendTransaction, so reads need an RPC endpoint. */
+  statusUpstream: Upstream;
   startedAt: number;
   iterations: number;
 }
 
 /**
  * Optional server-side resend loop for sendTransaction: re-submits the same
- * signed bytes to the same upstream until the signature confirms, its
- * blockhash expires, or the time budget ends. Re-sending identical bytes is
- * idempotent on-chain; it is never mirrored to a different upstream.
+ * signed bytes to the upstream that accepted them (Helius RPC, or Helius
+ * Sender when the call used it) until the signature confirms, its blockhash
+ * expires, or the time budget ends. Re-sending identical bytes is idempotent
+ * on-chain; a resend never goes to a route the caller did not choose.
  */
 export class Rebroadcaster {
   private readonly jobs = new Map<string, Job>();
@@ -60,7 +64,7 @@ export class Rebroadcaster {
     const now = Date.now();
     if (now - job.startedAt > this.opts.maxSeconds * 1000) return this.finish(job, "time budget exhausted");
     job.iterations += 1;
-    const status = await job.upstream.call(
+    const status = await job.statusUpstream.call(
       { jsonrpc: "2.0", id: 1, method: "getSignatureStatuses", params: [[job.signature]] },
       3000,
     );
@@ -71,7 +75,7 @@ export class Rebroadcaster {
       }
     }
     if (job.iterations % 5 === 0) {
-      const valid = await job.upstream.call(
+      const valid = await job.statusUpstream.call(
         { jsonrpc: "2.0", id: 1, method: "isBlockhashValid", params: [job.blockhash, { commitment: "processed" }] },
         3000,
       );
