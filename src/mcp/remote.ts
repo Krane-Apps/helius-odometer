@@ -421,8 +421,27 @@ async function paidCall(
   }
   const receiptKey = args.idempotencyKey ? { wallet: spender, key: args.idempotencyKey, requestId } : undefined;
 
+  // A bare session id spends its voucher, not the wallet. Hold the price now, in the same
+  // tick as the check and before any await, so simultaneous calls cannot each pass the
+  // check against the same allowance. The unused part is returned when the call resolves.
+  const voucher = viaToken ? undefined : state.binding;
+  if (!viaToken) {
+    if (!voucher || voucher.wallet !== spender || voucher.voucherMicros < quote.price) {
+      if (receiptKey) deps.ledger.idempotencyAbort(spender, receiptKey.key);
+      return attach(
+        await paymentRequired(deps, toolName, await deps.payments.buildTopupRequirements(), "Prepaid balance too low for this session; pay a top-up"),
+      );
+    }
+    voucher.voucherMicros -= quote.price;
+  }
+  // Returns to the binding that was held, even if the session was rebound meanwhile.
+  const returnToVoucher = (amount: number) => {
+    if (voucher && amount > 0) voucher.voucherMicros += amount;
+  };
+
   const reservation = deps.ledger.reserve({ wallet: spender, amount: quote.price, tier, methods: [method], requestId });
   if (!reservation.ok) {
+    returnToVoucher(quote.price);
     if (receiptKey) deps.ledger.idempotencyAbort(spender, receiptKey.key);
     if (reservation.reason === "daily_cap_exceeded") {
       return attach(text({ error: "daily_cap_exceeded", message: "This wallet reached its daily spend cap; not charged" }, true));
@@ -438,6 +457,7 @@ async function paidCall(
     );
   } catch (err) {
     deps.ledger.release(reservation.reservationId, receiptKey);
+    returnToVoucher(quote.price);
     deps.logger.error("mcp call failed", { requestId, error: err });
     return attach(text({ error: "internal_error", requestId }, true));
   }
@@ -461,7 +481,7 @@ async function paidCall(
     outcome.billable ? 1 : 0,
     receiptKey ? { ...receiptKey, status: 200, headers: {}, body: JSON.stringify(result) } : undefined,
   );
-  if (!viaToken && state.binding?.wallet === spender) state.binding.voucherMicros = Math.max(0, state.binding.voucherMicros - fin.charged);
+  returnToVoucher(quote.price - fin.charged);
   deps.counters.calls += 1;
   deps.counters.revenueMicros += fin.charged;
   if (outcome.billable) deps.counters.billableCalls += 1;

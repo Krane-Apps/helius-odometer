@@ -92,6 +92,40 @@ describe("remote MCP spending authority", () => {
     await client.close();
   });
 
+  it("simultaneous calls cannot exceed what the session paid or reach older wallet funds", async () => {
+    const wallet = "McpRace1111111111111111111111111111111111111";
+    gw.odometer.deps.ledger.adjust(wallet, 5_000_000, "funded over HTTP");
+    const { client } = await connect(gw.url);
+    expect((await pay(client, wallet, 0)).isError).toBe(false); // pays $0.00003, spends $0.00001: two calls left
+    const results = await Promise.all(Array.from({ length: 12 }, () => call(client)));
+    expect(results.filter((r) => r.isError === false)).toHaveLength(2);
+    expect(results.filter(isPaymentRequired)).toHaveLength(10);
+    expect(gw.odometer.deps.ledger.available(wallet)).toBe(5_000_000);
+    expect(gw.odometer.deps.ledger.getAccount(wallet)!.reserved).toBe(0);
+    // The allowance is spent, not negative or stuck: the next call is asked to pay.
+    expect(isPaymentRequired(await call(client))).toBe(true);
+    await client.close();
+  });
+
+  it("a failed call returns its hold to the session allowance", async () => {
+    const wallet = "McpRefund11111111111111111111111111111111111";
+    gw.odometer.deps.ledger.adjust(wallet, 5_000_000, "funded over HTTP");
+    const { client } = await connect(gw.url);
+    expect((await pay(client, wallet, 0)).isError).toBe(false); // two calls left
+    pub.setHandler(() => ({ status: 503, raw: "down" }));
+    try {
+      const failed = await Promise.all(Array.from({ length: 4 }, () => call(client)));
+      expect(failed.every((r) => r.isError === true)).toBe(true);
+    } finally {
+      pub.setHandler(() => ({ result: 7 }));
+    }
+    // Nothing was charged, so both paid-for calls are still available.
+    const after = await Promise.all([call(client), call(client), call(client)]);
+    expect(after.filter((r) => r.isError === false)).toHaveLength(2);
+    expect(gw.odometer.deps.ledger.available(wallet)).toBe(5_000_000);
+    await client.close();
+  });
+
   it("a session token on the MCP transport spends the wallet balance, and dies with revocation", async () => {
     const wallet = "McpToken111111111111111111111111111111111111";
     gw.odometer.deps.ledger.adjust(wallet, 1_000_000, "funded over HTTP");
