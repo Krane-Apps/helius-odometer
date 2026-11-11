@@ -146,6 +146,7 @@ export function registerPublicRoutes(app: Hono, deps: AppDeps): void {
       return jsonResponse(c, 500, { error: "payment_configuration_error" });
     }
     const auth = await deps.paywall.authorize(c, 0, {});
+    if (auth.kind === "response") return auth.response;
     if (auth.kind === "respond") return jsonResponse(c, auth.status, auth.body, auth.headers);
     deps.counters.topups += 1;
     const headers = { ...(auth.paymentHeaders ?? {}), ...(auth.session ? sessionHeaders(auth.session) : {}) };

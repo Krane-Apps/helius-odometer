@@ -154,7 +154,10 @@ export class Upstream {
       }
       const text = await readCapped(res, MAX_RESPONSE_BYTES);
       const latencyMs = performance.now() - started;
-      if (res.status >= 500 || (res.status >= 400 && !text.trimStart().startsWith("{"))) {
+      // 401/402/403 mean the provider rejected this gateway's key or plan, even when the
+      // body is JSON-RPC shaped: an upstream failure, retried elsewhere and never billed.
+      const rejected = res.status === 401 || res.status === 402 || res.status === 403;
+      if (rejected || res.status >= 500 || (res.status >= 400 && !text.trimStart().startsWith("{"))) {
         return { kind: "http-error", status: res.status, latencyMs, error: text.slice(0, 200) };
       }
       let body: unknown;

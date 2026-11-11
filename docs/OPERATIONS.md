@@ -84,6 +84,7 @@ Every alert is logged as `ALERT <message>`. With `ALERT_WEBHOOK_URL` set it is a
 | `unrecorded:<signature>` | critical | Funds settled on-chain but the ledger could not record the credit | [needs_review runbook](#a-top-up-is-flagged-needs_review) |
 | `reconcile-mismatch` | critical | A balance disagrees with its journal | [mismatch runbook](#reconciliation-reports-a-mismatch) |
 | `reconcile-unresolved` | warning | Top-ups with an unknown outcome are waiting for review | [needs_review runbook](#a-top-up-is-flagged-needs_review) |
+| `helius-auth` | critical | Helius rejected the operator's API key or plan on a REST route; customers get 502 and are not charged | Check `HELIUS_API_KEY` and the plan |
 | `writer-lock` | critical | Another process took over the ledger; this one exits | Find the second instance |
 
 Logs are one JSON object per line. Also watch for sustained `upstream ejected`.

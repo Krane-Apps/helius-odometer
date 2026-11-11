@@ -552,6 +552,34 @@ export class Ledger {
     });
   }
 
+  /**
+   * The stored response for a finished request with this key and hash, without
+   * creating or changing anything. Lets a caller recover a response it already
+   * paid for even when its balance could not pay for a new call.
+   */
+  idempotencyPeek(wallet: string, key: string, requestHash: string): { status: number; headers: Record<string, string>; body: string } | undefined {
+    const row = this.q("SELECT request_hash, status, http_status, headers, body FROM idempotency WHERE wallet = ? AND key = ?").get(wallet, key) as
+      | { request_hash: string; status: string; http_status: number | null; headers: string | null; body: string | null }
+      | undefined;
+    if (!row || row.status !== "done" || row.request_hash !== requestHash) return undefined;
+    return {
+      status: row.http_status ?? 200,
+      headers: row.headers ? (JSON.parse(row.headers) as Record<string, string>) : {},
+      body: row.body ?? "",
+    };
+  }
+
+  /**
+   * Set when the wallet's daily cap alone rules out spending `amount` today,
+   * whatever its balance: a deposit would not help, so none should be asked for.
+   */
+  dailyCapBlock(wallet: string, amount: Micros): { cap: Micros; spentToday: Micros } | undefined {
+    const cap = this.effectiveDailyCap(this.getAccount(wallet));
+    if (cap === null) return undefined;
+    const spentToday = this.spentToday(wallet);
+    return spentToday + amount > cap ? { cap, spentToday } : undefined;
+  }
+
   idempotencyComplete(wallet: string, key: string, status: number, headers: Record<string, string>, body: string): void {
     this.q("UPDATE idempotency SET status = 'done', http_status = ?, headers = ?, body = ? WHERE wallet = ? AND key = ?")
       .run(status, JSON.stringify(headers), body, wallet, key);

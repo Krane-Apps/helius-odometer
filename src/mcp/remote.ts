@@ -332,6 +332,26 @@ async function paidCall(
   } else if (bindingState(deps, state, auth.ip, index) === "usable") {
     wallet = state.binding!.wallet;
   }
+  const requestHash = sha256Hex(`mcp\n${tier}\n${canonicalJson({ method, params: params ?? null })}`);
+  if (wallet) {
+    // Neither answer depends on the balance, so neither may turn into a request for money:
+    // a response this wallet already paid for, and a call its spending cap rules out.
+    const stored = args.idempotencyKey ? deps.ledger.idempotencyPeek(wallet, args.idempotencyKey, requestHash) : undefined;
+    if (stored) {
+      const replay = JSON.parse(stored.body) as ToolResult;
+      return { ...replay, _meta: { ...replay._meta, "odometer/idempotentReplay": true } };
+    }
+    const block = deps.ledger.dailyCapBlock(wallet, quote.price);
+    if (block) {
+      return text(
+        {
+          error: "daily_cap_exceeded",
+          message: block.cap === 0 ? "Spending is stopped for this wallet; not charged" : "This wallet reached its daily spend cap; not charged",
+        },
+        true,
+      );
+    }
+  }
   const spendable = () =>
     wallet ? Math.min(deps.ledger.available(wallet), viaToken ? Number.POSITIVE_INFINITY : (state.binding?.voucherMicros ?? 0)) : 0;
 
@@ -411,7 +431,7 @@ async function paidCall(
 
   const requestId = newId("req");
   if (args.idempotencyKey) {
-    const begin = deps.ledger.idempotencyBegin(spender, args.idempotencyKey, sha256Hex(`mcp\n${tier}\n${canonicalJson({ method, params: params ?? null })}`));
+    const begin = deps.ledger.idempotencyBegin(spender, args.idempotencyKey, requestHash);
     if (begin.state === "replay") {
       const stored = JSON.parse(begin.body) as ToolResult;
       return attach({ ...stored, _meta: { ...stored._meta, "odometer/idempotentReplay": true } });

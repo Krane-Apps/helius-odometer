@@ -91,6 +91,23 @@ async function proxy(
         });
         const text = await res.text();
         const latency = performance.now() - started;
+        // 401, 402 and 403 are about the operator's Helius key or plan, never about the
+        // customer's request: not charged, and Helius's text (which may echo the key) is not passed on.
+        if (res.status === 401 || res.status === 402 || res.status === 403) {
+          deps.metrics.record("helius-rest", routeId, "helius", latency, false);
+          deps.logger.error("helius rejected the operator credentials", { routeId, status: res.status });
+          void deps.alerter.alert("helius-auth", "critical", "Helius rejected the operator's API key or plan; REST calls are failing (customers are not charged)", {
+            routeId,
+            status: res.status,
+          });
+          return {
+            status: 502,
+            body: JSON.stringify({ error: "upstream_auth_failed", message: "The gateway could not authenticate to its upstream. Not charged." }),
+            headers: { "x-odometer-upstream": "helius", "x-odometer-upstream-class": "helius" },
+            charged: 0,
+            calls: 0,
+          };
+        }
         const billable = (res.status >= 200 && res.status < 300) || (res.status >= 400 && res.status < 500 && res.status !== 429);
         deps.counters.heliusCalls += 1;
         deps.counters.heliusCreditsEstimate += 100;

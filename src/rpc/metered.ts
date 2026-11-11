@@ -60,7 +60,40 @@ export async function metered(c: Context, deps: AppDeps, args: MeteredArgs): Pro
     }
   }
 
-  const auth = await paywall.authorize(c, args.price, args.body);
+  const idemKey = c.req.header("idempotency-key");
+  if (idemKey !== undefined && (idemKey.length === 0 || idemKey.length > MAX_IDEMPOTENCY_KEY)) {
+    return jsonResponse(c, 400, { error: "invalid_idempotency_key" }, base);
+  }
+  const requestHash = sha256Hex(`${args.tier}\n${args.fingerprint}`);
+  const capRefusal = (wallet: string, block: { cap: Micros; spentToday: Micros }, headers: Record<string, string>) =>
+    jsonResponse(
+      c,
+      429,
+      {
+        error: "daily_cap_exceeded",
+        message: block.cap === 0 ? "Spending is stopped for this wallet; not charged" : "This wallet reached its daily spend cap; not charged",
+        capUsd: microsToUsd(block.cap),
+        spentTodayUsd: microsToUsd(block.spentToday),
+      },
+      { ...headers, "retry-after": retryAfterUntilUtcMidnight() },
+    );
+
+  const auth = await paywall.authorize(c, args.price, args.body, {
+    // The wallet cannot pay for a new call. Two answers do not depend on that, and
+    // neither should turn into a request for money:
+    beforeChallenge: (wallet) => {
+      const known = { ...base, "x-odometer-wallet": wallet };
+      // 1. it already paid for this exact request: hand the stored response back;
+      const stored = idemKey ? ledger.idempotencyPeek(wallet, idemKey, requestHash) : undefined;
+      if (stored) {
+        return rawJsonResponse(stored.status, stored.body, { ...stored.headers, ...known, "x-odometer-idempotent-replay": "true", "x-odometer-charged": "0" });
+      }
+      // 2. its spending cap rules the call out, so a deposit would not help.
+      const block = ledger.dailyCapBlock(wallet, args.price);
+      return block ? capRefusal(wallet, block, known) : undefined;
+    },
+  });
+  if (auth.kind === "response") return auth.response;
   if (auth.kind === "respond") {
     if (auth.status === 402) deps.counters.challenges += 1;
     if (auth.isHtml) {
@@ -87,12 +120,8 @@ export async function metered(c: Context, deps: AppDeps, args: MeteredArgs): Pro
     );
   }
 
-  const idemKey = c.req.header("idempotency-key");
-  if (idemKey !== undefined && (idemKey.length === 0 || idemKey.length > MAX_IDEMPOTENCY_KEY)) {
-    return jsonResponse(c, 400, { error: "invalid_idempotency_key" }, extra);
-  }
   if (idemKey) {
-    const begin = ledger.idempotencyBegin(wallet, idemKey, sha256Hex(`${args.tier}\n${args.fingerprint}`));
+    const begin = ledger.idempotencyBegin(wallet, idemKey, requestHash);
     if (begin.state === "replay") {
       return rawJsonResponse(begin.status, begin.body, { ...begin.headers, ...extra, "x-odometer-idempotent-replay": "true", "x-odometer-charged": "0" });
     }

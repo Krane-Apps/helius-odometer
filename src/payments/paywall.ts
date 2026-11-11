@@ -23,7 +23,18 @@ export type AuthResult =
       paymentHeaders?: Record<string, string>;
       toppedUp?: { txSignature: string; amountAtomic: string };
     }
-  | { kind: "respond"; status: number; headers: Record<string, string>; body: unknown; isHtml?: boolean };
+  | { kind: "respond"; status: number; headers: Record<string, string>; body: unknown; isHtml?: boolean }
+  /** A finished response from `beforeChallenge`, returned as is. */
+  | { kind: "response"; response: Response };
+
+export interface AuthorizeOptions {
+  /**
+   * Runs when the wallet is known but cannot pay, before a top-up is requested.
+   * A returned response replaces the 402: use it for answers a deposit would
+   * not change (a stored replay, a spending cap).
+   */
+  beforeChallenge?: (wallet: string) => Response | undefined;
+}
 
 export interface PaywallDeps {
   payments: Payments;
@@ -48,7 +59,7 @@ const RENEW_WITHIN_MS = 5 * 60_000;
 export class Paywall {
   constructor(private readonly deps: PaywallDeps) {}
 
-  async authorize(c: Context, price: Micros, body: unknown): Promise<AuthResult> {
+  async authorize(c: Context, price: Micros, body: unknown, opts: AuthorizeOptions = {}): Promise<AuthResult> {
     const { payments, ledger, sessions, siwx, logger } = this.deps;
     const paymentHeader = c.req.header("payment-signature") ?? c.req.header("x-payment");
 
@@ -88,6 +99,11 @@ export class Paywall {
       const account = ledger.getAccount(wallet);
       const available = account?.available ?? 0;
       if (available >= price) return { kind: "ok", wallet, via, session };
+      const early = opts.beforeChallenge?.(wallet);
+      if (early) {
+        if (session) for (const [k, v] of Object.entries(sessionHeaders(session))) early.headers.set(k, v);
+        return { kind: "response", response: early };
+      }
       challenge.reason = "insufficient_balance";
       challenge.wallet = wallet;
       challenge.available = available;
