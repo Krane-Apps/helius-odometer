@@ -67,6 +67,8 @@ describe("follow-up review findings", () => {
         HELIUS_API_BASE: `http://127.0.0.1:${(rest.address() as AddressInfo).port}`,
         WALLET_RPS: "1000",
         IP_RPS: "1000",
+        HELIUS_RPS: "1000",
+        HELIUS_HEAVY_RPS: "1000",
         REMOTE_MCP_SESSIONS_PER_MINUTE: "1000",
       },
       new FakeFacilitator(SOLANA_DEVNET),
@@ -93,6 +95,32 @@ describe("follow-up review findings", () => {
         expect(gw.odometer.deps.ledger.available(wallet)).toBe(1_000_000);
       });
     }
+
+    for (const [label, reply, expected] of [
+      ["404 (a route the upstream does not know)", { status: 404, body: '{"error":"not found"}' }, 502],
+      ["405", { status: 405, body: "{}" }, 502],
+      ["429", { status: 429, body: "{}" }, 429],
+      ["500", { status: 500, body: '{"error":"boom"}' }, 500],
+      ["503 with a non-JSON body", { status: 503, body: "<html>down</html>" }, 503],
+      ["200 with an error body", { status: 200, body: '{"error":"internal"}' }, 502],
+      ["200 that is not JSON", { status: 200, body: "<html>" }, 502],
+    ] as const) {
+      it(`does not charge for a Helius ${label}`, async () => {
+        const wallet = `RestFree${label.replace(/[^a-z0-9]/gi, "")}`.padEnd(44, "1").slice(0, 44);
+        gw.odometer.deps.ledger.adjust(wallet, 1_000_000, "test funding");
+        restReply = reply;
+        const res = await parse(session(wallet));
+        expect(res.status).toBe(expected);
+        expect(res.headers.get("x-odometer-charged")).toBe("0");
+        expect(gw.odometer.deps.ledger.available(wallet)).toBe(1_000_000);
+      });
+    }
+
+    it("publishes the REST billing rule with the rest of the contract", async () => {
+      const pricing = await json(fetch(`${gw.url}/pricing`));
+      expect(String(pricing.billing.rest)).toMatch(/400 or 422/);
+      expect(String(pricing.billing.rest)).toMatch(/not charged when the upstream rejects the gateway's credentials/);
+    });
 
     it("still charges for answers the request itself caused", async () => {
       const wallet = "RestBilled11111111111111111111111111111111111";

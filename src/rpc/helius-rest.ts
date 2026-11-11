@@ -19,6 +19,27 @@ export const REST_ROUTES = [
   },
 ] as const;
 
+/**
+ * What a Helius REST answer means for billing. Only an answer to the request
+ * itself is billed: a result, or a rejection of the customer's own input.
+ * Everything else is the gateway's or the upstream's failure and is free:
+ * the operator's key or plan (401/402/403), a route the upstream does not
+ * know (404 and other 4xx: these paths are fixed by the gateway, so that is
+ * configuration), rate limits, 5xx, and a 2xx whose body is an error object.
+ */
+export function classifyRestAnswer(status: number, body: string): "billed" | "auth_failed" | "rate_limited" | "upstream_failed" {
+  if (status === 401 || status === 402 || status === 403) return "auth_failed";
+  if (status === 429) return "rate_limited";
+  if (status === 400 || status === 422) return "billed";
+  if (status >= 200 && status < 300) {
+    const parsed = safeJsonParse(body);
+    if (!parsed.ok) return "upstream_failed";
+    const v = parsed.value as { error?: unknown } | null;
+    return v && typeof v === "object" && !Array.isArray(v) && v.error !== undefined ? "upstream_failed" : "billed";
+  }
+  return "upstream_failed";
+}
+
 const ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const HISTORY_QUERY = new Set(["before", "until", "limit", "type", "source", "commitment", "sort-order", "gt-slot", "lt-slot", "gt-time", "lt-time"]);
 
@@ -93,7 +114,8 @@ async function proxy(
         const latency = performance.now() - started;
         // 401, 402 and 403 are about the operator's Helius key or plan, never about the
         // customer's request: not charged, and Helius's text (which may echo the key) is not passed on.
-        if (res.status === 401 || res.status === 402 || res.status === 403) {
+        const verdict = classifyRestAnswer(res.status, text);
+        if (verdict === "auth_failed") {
           deps.metrics.record("helius-rest", routeId, "helius", latency, false);
           deps.logger.error("helius rejected the operator credentials", { routeId, status: res.status });
           void deps.alerter.alert("helius-auth", "critical", "Helius rejected the operator's API key or plan; REST calls are failing (customers are not charged)", {
@@ -108,7 +130,19 @@ async function proxy(
             calls: 0,
           };
         }
-        const billable = (res.status >= 200 && res.status < 300) || (res.status >= 400 && res.status < 500 && res.status !== 429);
+        const billable = verdict === "billed";
+        if (verdict === "upstream_failed" && res.status < 500) {
+          // An unexpected 4xx, or a 2xx carrying an error: not an answer to this request.
+          deps.metrics.record("helius-rest", routeId, "helius", latency, false);
+          deps.logger.warn("helius rest answered unexpectedly", { routeId, status: res.status });
+          return {
+            status: 502,
+            body: JSON.stringify({ error: "upstream_error", message: "The upstream did not answer this request. Not charged." }),
+            headers: { "x-odometer-upstream": "helius", "x-odometer-upstream-class": "helius" },
+            charged: 0,
+            calls: 0,
+          };
+        }
         deps.counters.heliusCalls += 1;
         deps.counters.heliusCreditsEstimate += 100;
         deps.metrics.record("helius-rest", routeId, "helius", latency, billable);

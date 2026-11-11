@@ -5,7 +5,7 @@
 | `npm run typecheck` | `tsc --noEmit` over source, tests and scripts | Node 22.13+ |
 | `npm test` | Unit and integration tests | Node 22.13+ |
 | `npm run test:e2e` | End-to-end suite on a local validator | `solana-test-validator` on PATH, or Docker |
-| `npm run test:audit` | The 2026-11-09 review's reproduction scripts, as regression checks | `npm run build` first |
+| `npm run test:audit` | Both reviews' reproduction scripts (2026-11-09 and 2026-11-11), as regression checks | `npm run build` first |
 | `npm run test:all` | All of the above | both |
 | `npm run localnet -- --demo` | Interactive local environment plus a scripted agent session | `solana-test-validator` or Docker |
 

@@ -9,6 +9,8 @@ export const BILLING_CONTRACT = {
     "Gateway and upstream delivery failures: timeouts, rate limits, unhealthy or lagging nodes, exhausted pools and gateway errors.",
   charged:
     "Valid RPC answers, including errors caused by the request itself: invalid request or params, failed preflight simulation, signature verification failure and the other codes in billedErrorCodes.",
+  rest:
+    "Helius REST routes are charged for a result or for a rejection of your own input (HTTP 400 or 422). They are not charged when the upstream rejects the gateway's credentials, does not know the route, rate-limits, fails, or returns an error body.",
   sendTransaction:
     "A charged sendTransaction means the RPC accepted the transaction. It does not mean the transaction landed or succeeded; check getSignatureStatuses.",
   separateCosts:

@@ -150,4 +150,20 @@ describe("client top-up budget", () => {
     expect(gw.payments()).toBe(1);
     expect(c.spentOnTopupsMicros).toBe(1_000_000);
   });
+
+  it("signs nothing when the gateway says the call is forbidden, not unfunded", async () => {
+    const signer = await generateKeyPairSigner();
+    const gateway = fakeGateway();
+    // A wallet with spending stopped: the gateway refuses with 429 and offers no payment.
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes("/v1/auth/")) return gateway.fetchImpl(input, init);
+      return Response.json({ error: "daily_cap_exceeded", message: "Spending is stopped for this wallet; not charged" }, { status: 429 });
+    }) as typeof fetch;
+    const c = await client(signer, { fetch: fetchImpl });
+    const signed = mockSigning(c);
+    await expect(c.rpc("getSlot")).rejects.toMatchObject({ code: "daily_cap_exceeded" });
+    expect(signed()).toBe(0);
+    expect(gateway.payments()).toBe(0);
+  });
 });

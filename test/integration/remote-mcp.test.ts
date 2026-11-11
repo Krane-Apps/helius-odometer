@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { PaymentRequired } from "@x402/core/types";
@@ -207,5 +207,102 @@ describe("remote MCP session lifetime and limits", () => {
     }
     expect(refused).toBe(true);
     await Promise.all(opened.map((c) => c.close()));
+  });
+});
+
+/**
+ * In-flight accounting for the session allowance (2026-11-11 review). Each test
+ * gets its own gateway: failing an upstream on purpose puts it into cooldown.
+ */
+describe("remote MCP allowance under concurrency", () => {
+  let own: { pub: MockRpc; gw: StartedApp };
+  beforeEach(async () => {
+    const p = await startMockRpc(() => ({ result: 7 }));
+    own = {
+      pub: p,
+      gw: await startApp(
+        { PUBLIC_UPSTREAMS: p.url, TOPUP_OPTIONS_USD: "0.00003,1", TRUST_PROXY: "true", WALLET_RPS: "1000", REMOTE_MCP_SESSIONS_PER_MINUTE: "1000" },
+        new FakeFacilitator(SOLANA_DEVNET),
+      ),
+    };
+  });
+  afterEach(async () => {
+    await own.gw.close();
+    await own.pub.close();
+  });
+
+  it("mixed outcomes in parallel charge only the calls that were served", async () => {
+    const wallet = "McpMixed111111111111111111111111111111111111";
+    own.gw.odometer.deps.ledger.adjust(wallet, 5_000_000, "funded over HTTP");
+    const { client } = await connect(own.gw.url);
+    expect((await pay(client, wallet, 1)).isError).toBe(false); // $1 allowance
+    const before = own.gw.odometer.deps.ledger.available(wallet);
+    own.pub.setHandler((method) => (method === "getBlockHeight" ? { status: 503, raw: "down" } : { result: 7 }));
+    try {
+      const results = await Promise.all([
+        call(client, { method: "getSlot" }),
+        call(client, { method: "getBlockHeight" }),
+        call(client, { method: "getSlot" }),
+        call(client, { method: "getBlockHeight" }),
+      ]);
+      expect(results.map((r) => r.isError)).toEqual([false, true, false, true]);
+    } finally {
+      own.pub.setHandler(() => ({ result: 7 }));
+    }
+    expect(before - own.gw.odometer.deps.ledger.available(wallet)).toBe(20);
+    const balance = body(await (client.callTool({ name: "odometer_balance", arguments: {} }) as Promise<ToolResult>));
+    expect(balance.sessionSpendableUsd).toBe("0.99997"); // $1 less the paid call and the two served
+    await client.close();
+  });
+
+  it("a revocation while calls are in flight ends the session, and their refunds do not revive it", async () => {
+    const wallet = "McpRevokeFlight11111111111111111111111111111";
+    own.gw.odometer.deps.ledger.adjust(wallet, 5_000_000, "funded over HTTP");
+    const { client } = await connect(own.gw.url);
+    expect((await pay(client, wallet, 1)).isError).toBe(false);
+    own.pub.setHandler(() => ({ status: 503, raw: "down", delayMs: 150 }));
+    try {
+      const inFlight = Promise.all([call(client), call(client), call(client)]);
+      await new Promise((r) => setTimeout(r, 40));
+      own.gw.odometer.deps.ledger.bumpSessionEpoch(wallet);
+      expect((await inFlight).every((r) => r.isError === true)).toBe(true);
+    } finally {
+      own.pub.setHandler(() => ({ result: 7 }));
+    }
+    const balanceBefore = own.gw.odometer.deps.ledger.available(wallet);
+    const after = await Promise.all([call(client), call(client)]);
+    expect(after.every(isPaymentRequired)).toBe(true);
+    expect(own.gw.odometer.deps.ledger.available(wallet)).toBe(balanceBefore);
+    await client.close();
+  });
+
+  it("rebinding the session to another payer does not inherit refunds from the old payer's calls", async () => {
+    const first = "McpRebindA1111111111111111111111111111111111";
+    const second = "McpRebindB1111111111111111111111111111111111";
+    own.gw.odometer.deps.ledger.adjust(second, 5_000_000, "funded over HTTP");
+    const { client } = await connect(own.gw.url);
+    expect((await pay(client, first, 0)).isError).toBe(false); // first payer: two calls left
+    // Two slow, failing calls hold the first payer's whole allowance while a second payer takes over the session.
+    own.pub.setHandler((method) => (method === "getBlockHeight" ? { status: 503, raw: "down", delayMs: 250 } : { result: 7 }));
+    try {
+      const inFlight = Promise.all([call(client, { method: "getBlockHeight" }), call(client, { method: "getBlockHeight" })]);
+      await new Promise((r) => setTimeout(r, 50));
+      const challenge = await call(client);
+      expect(isPaymentRequired(challenge)).toBe(true);
+      const pr = challenge.structuredContent as PaymentRequired;
+      const rebound = await call(client, { method: "getSlot" }, {
+        "x402/payment": { x402Version: 2, accepted: pr.accepts[0], resource: pr.resource, payload: { transaction: `fake:${second}:${++nonce}` } },
+      });
+      expect(rebound.isError).toBe(false);
+      expect((await inFlight).every((r) => r.isError === true)).toBe(true);
+    } finally {
+      own.pub.setHandler(() => ({ result: 7 }));
+    }
+    const balance = body(await (client.callTool({ name: "odometer_balance", arguments: {} }) as Promise<ToolResult>));
+    expect(balance.wallet).toBe(second);
+    // Exactly what the second payer paid, less its one call: the first payer's refunds did not land here.
+    expect(balance.sessionSpendableUsd).toBe("0.00002");
+    expect(own.gw.odometer.deps.ledger.available(second)).toBe(5_000_000 + 30 - 10);
+    await client.close();
   });
 });

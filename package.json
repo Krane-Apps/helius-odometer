@@ -26,7 +26,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
-    "test:audit": "node audit-repro.mjs && tsx audit-remote.ts",
+    "test:audit": "node audit-repro.mjs && tsx audit-remote.ts && tsx audit-mcp-replay.ts && tsx audit-rest-cap.ts",
     "test:all": "npm run typecheck && npm test && npm run build && npm run test:audit && npm run test:e2e",
     "facilitator": "tsx src/facilitator/main.ts",
     "mcp": "tsx src/mcp/main.ts",
